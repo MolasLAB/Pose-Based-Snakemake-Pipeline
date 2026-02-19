@@ -1,0 +1,43 @@
+# =============================================================================
+# SLEAP Conda Environment (Windows Compatible)
+# =============================================================================
+# This environment is specifically for SLEAP pose estimation.
+# SLEAP is installed via pip for Windows compatibility.
+# =============================================================================
+
+name: sleap
+
+channels:
+  - conda-forge
+  - nvidia
+  - defaults
+
+dependencies:
+  # Core Python (SLEAP 1.5+ supports Python 3.10)
+  - python>=3.10,<3.12
+
+  # CUDA support via conda
+  - cudatoolkit>=11.3
+  - cudnn>=8.2
+
+  # Core dependencies via conda (minimal to avoid Qt issues)
+  - numpy>=1.21
+  - scipy>=1.4
+  - pandas>=1.0
+  - h5py>=2.10
+  - attrs>=19.3
+  - pyyaml
+  - imageio>=2.3
+
+  # pip for additional packages
+  - pip
+  - pip:
+    # SLEAP latest stable (1.5.2) - Windows compatible via pip
+    - sleap[pypi]>=1.5.0
+    # Use headless opencv to avoid Qt issues on Windows
+    - opencv-python-headless>=4.2
+    - scikit-image>=0.18
+    - scikit-learn>=0.24
+    # Additional pip packages
+    - qimage2ndarray
+    - imgstore

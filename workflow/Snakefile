@@ -1,0 +1,636 @@
+"""
+Pose Estimation and Behavioral Feature Extraction Pipeline
+==========================================================
+
+This Snakemake pipeline processes behavioral videos through:
+1. Video preprocessing (ROI labeling, representative image — no ffmpeg)
+2. Video cropping + metadata/PTS extraction (ffmpeg + ffprobe)
+3. SLEAP pose estimation
+4. Event conversion (timestamps → frame indices via PTS)
+5. Pose post-processing (identity swap correction, interpolation)
+6. Feature extraction (SimBA-independent)
+7. ROI-based feature analysis
+8. Feature analysis (event-oriented, uses event CSV)
+9. Analysis correction (identity swap correction via manual scores)
+
+Author: June (Molas Lab)
+
+DIRECTORY STRUCTURE:
+====================
+The pipeline expects videos organized as:
+    {base_path}/{identity}/{day}/raw_data/{video}.mp4
+
+Where:
+    - base_path: Root folder (e.g., Z:/Social_Looming/Behavior/5VLS)
+    - identity: Animal ID (e.g., TRAP2-150 for single, TRAP2-153+154 for pairs)
+    - day: Session folder (e.g., D1, D2)
+
+Pipeline outputs go to:
+    {base_path}/{identity}/{day}/pipeline/
+
+TWO-PHASE WORKFLOW (Recommended for Manual ROI Labeling):
+=========================================================
+    PHASE 1: Label all ROIs sequentially (requires user interaction)
+        conda activate cvenv
+        snakemake --cores 1 --until all_rois_labeled
+
+    PHASE 2: Run remaining pipeline in parallel (no user interaction)
+        snakemake --cores 8
+
+DAG STRUCTURE (post-ROI labeling):
+==================================
+    preprocessing (ROI) ──► crop_video (+metadata, +PTS)
+                                ├──► sleap_inference ──► sleap_export_csv ──► pose_postprocessing ──► feature_extraction ──► roi_features ─┐
+                                └──► event_convertor ──────────────────────────────────────────────────────────────────────────────────────┴──► feature_analysis ──► analysis_correction
+
+ENVIRONMENT SETUP:
+    Run this pipeline from an environment with opencv, numpy, pandas, etc.
+    SLEAP rules will use conda run to execute in the separate sleap environment.
+"""
+
+import os
+import json
+import re
+from pathlib import Path
+
+# Load configuration
+configfile: "workflow/config.yaml"
+
+
+workflow.global_resources["gpu"] = 1  # There is only 1 gpu
+workflow.global_resources["user"] = 2  # Resource for sequential user interaction
+
+
+# Helper functions
+def ensure_output_dirs(output_files):
+    """Ensure all output directories exist"""
+    from pathlib import Path
+    for f in output_files:
+        Path(f).parent.mkdir(parents=True, exist_ok=True)
+
+def discover_samples():
+    """
+    Discover all samples by scanning the hierarchical folder structure.
+
+    Expected structure:
+        {base_path}/{identity}/{day}/raw_data/{video}.mp4
+    """
+    base_path = Path(config["paths"]["base_path"])
+    extensions = config["video"]["extensions"]
+    samples = []
+
+    if not base_path.exists():
+        print(f"Warning: Base path does not exist: {base_path}")
+        return samples
+
+    for identity_dir in base_path.iterdir():
+        if not identity_dir.is_dir():
+            continue
+        identity = identity_dir.name
+
+        for day_dir in identity_dir.iterdir():
+            if not day_dir.is_dir():
+                continue
+            day = day_dir.name
+
+            raw_data_dir = day_dir / "raw_data"
+            if not raw_data_dir.exists():
+                continue
+
+            for ext in extensions:
+                for video_file in raw_data_dir.glob(f"*{ext}"):
+                    samples.append({
+                        "identity": identity,
+                        "day": day,
+                        "video_stem": video_file.stem,
+                        "video_path": str(video_file)
+                    })
+
+    return samples
+
+def get_experiment_type(identity):
+    """Determine if sample is single or paired animal based on identity naming"""
+    if '+' in identity:
+        return "paired"
+    return "single"
+
+def get_video_path(wildcards):
+    """Get the input video path for a given identity/day"""
+    base_path = Path(config["paths"]["base_path"])
+    raw_data_dir = base_path / wildcards.identity / wildcards.day / "raw_data"
+
+    extensions = config["video"]["extensions"]
+    for ext in extensions:
+        videos = list(raw_data_dir.glob(f"*{ext}"))
+        if videos:
+            return str(videos[0])
+
+    default_ext = config["video"]["default_extension"]
+    return str(raw_data_dir / f"{wildcards.identity}_{wildcards.day}.{default_ext}")
+
+def build_event_sources(wildcards):
+    """Build the event sources list for event_convertor from config."""
+    sources = []
+    for source_cfg in config.get("events", {}).get("sources", []):
+        src = dict(source_cfg)
+        # Resolve path references from config paths section
+        if src.get('path_key'):
+            src['path'] = config['paths'][src['path_key']]
+            del src['path_key']
+        sources.append(src)
+    return sources
+
+
+# Discover all samples from the folder structure
+SAMPLE_INFO = discover_samples()
+IDENTITY_DAY_PAIRS = [(s["identity"], s["day"]) for s in SAMPLE_INFO]
+
+USE_MANUAL_ROI = config.get("roi", {}).get("use_manual_labeling", True)
+BASE_PATH = config["paths"]["base_path"]
+
+
+# =============================================================================
+# TARGET RULE
+# =============================================================================
+
+rule all:
+    input:
+        [f"{BASE_PATH}/{identity}/{day}/pipeline/analysis/{identity}_{day}_correction.done"
+         for identity, day in IDENTITY_DAY_PAIRS],
+
+
+# =============================================================================
+# STAGE 1: VIDEO PREPROCESSING (ROI labeling only — no ffmpeg)
+# =============================================================================
+
+rule video_preprocessing:
+    """
+    Generate background image and define ROI zones (manual GUI or automatic).
+
+    No ffmpeg/ffprobe calls — metadata extraction is delegated to crop_video.
+    This keeps the interactive labeling phase lightweight and sequential.
+
+    Outputs:
+    - ROI data (floor corners, nest zone, loom zone)
+    - Representative background image with ROI visualization
+    """
+    input:
+        video = get_video_path
+    output:
+        roi_data = BASE_PATH + "/{identity}/{day}/pipeline/metadata/{identity}_{day}_roi.json",
+    params:
+        frame_span = config["preprocessing"]["background_frame_span"],
+        min_area_ratio = config["preprocessing"]["roi_min_area_ratio"],
+        canny_low = config["preprocessing"]["canny_threshold_low"],
+        canny_high = config["preprocessing"]["canny_threshold_high"],
+        use_manual_roi = USE_MANUAL_ROI,
+        manual_roi_config = config.get("roi", {}).get("manual_roi_config", "results/metadata/manual_roi_config.json"),
+        nest_percent = config.get("roi", {}).get("nest_percent_of_perspective", 0.1955),
+        nest_buffer = config.get("roi", {}).get("nest_buffer", 40),
+        loom_percent = config.get("roi", {}).get("loom_percent_of_perspective", 0.1506),
+        loom_radius = config.get("roi", {}).get("loom_radius", 32)
+    log:
+        BASE_PATH + "/{identity}/{day}/pipeline/logs/{identity}_{day}_preprocessing.log"
+    benchmark:
+        BASE_PATH + "/{identity}/{day}/pipeline/benchmarks/{identity}_{day}_preprocessing.txt"
+    threads: 2
+    resources:
+        mem_mb = 4000,
+        user = 1
+    script:
+        "scripts/video_preprocessing.py"
+
+
+# =============================================================================
+# CHECKPOINT: COMPLETE ALL ROI LABELING BEFORE PARALLEL PROCESSING
+# =============================================================================
+
+checkpoint all_rois_labeled:
+    """
+    Ensures all ROI labeling is complete before proceeding.
+    Run with: snakemake --cores 1 --until all_rois_labeled
+    Then run: snakemake --cores 8
+    """
+    input:
+        roi_files = [f"{BASE_PATH}/{identity}/{day}/pipeline/metadata/{identity}_{day}_roi.json"
+                     for identity, day in IDENTITY_DAY_PAIRS],
+    output:
+        done_flag = BASE_PATH + "/.all_rois_labeled"
+    run:
+        import datetime
+        ensure_output_dirs([output.done_flag])
+        with open(output.done_flag, 'w') as f:
+            f.write(f"All ROI labeling completed at {datetime.datetime.now()}\n")
+            f.write(f"Videos labeled: {len(input.roi_files)}\n")
+            for roi_file in input.roi_files:
+                f.write(f"  - {roi_file}\n")
+
+
+# =============================================================================
+# STAGE 2: VIDEO CROPPING + METADATA + PTS EXTRACTION
+# =============================================================================
+
+rule crop_video:
+    """
+    Crop video to ROI, then probe the cropped output for:
+    - Stream metadata (resolution, fps, duration, codec)
+    - Per-frame PTS timestamps (for VFR-accurate event-to-frame mapping)
+
+    The PTS extraction uses ffprobe on the cropped video (reads packet headers,
+    no frame decoding — fast even for 30-min videos).
+
+    Depends on all_rois_labeled checkpoint to ensure sequential labeling
+    completes before parallel processing begins.
+    """
+    input:
+        video = get_video_path,
+        roi_data = rules.video_preprocessing.output.roi_data,
+        all_rois_done = BASE_PATH + "/.all_rois_labeled"
+    output:
+        cropped_video = BASE_PATH + "/{identity}/{day}/pipeline/preprocessed/{identity}_{day}_cropped.mp4",
+        metadata = BASE_PATH + "/{identity}/{day}/pipeline/metadata/{identity}_{day}_metadata.json",
+        pts_csv = BASE_PATH + "/{identity}/{day}/pipeline/metadata/{identity}_{day}_pts.csv",
+        roi_data_cropped = BASE_PATH + "/{identity}/{day}/pipeline/metadata/{identity}_{day}_roi_cropped.json",
+        representative_image = BASE_PATH + "/{identity}/{day}/pipeline/qc/{identity}_{day}_representative.jpeg"
+    log:
+        BASE_PATH + "/{identity}/{day}/pipeline/logs/{identity}_{day}_crop.log"
+    benchmark:
+        BASE_PATH + "/{identity}/{day}/pipeline/benchmarks/{identity}_{day}_crop.txt"
+    threads: 4
+    script:
+        "scripts/crop_video.py"
+
+
+# =============================================================================
+# STAGE 3: SLEAP POSE ESTIMATION (branches from crop_video)
+# =============================================================================
+
+rule sleap_inference:
+    """
+    Run SLEAP pose estimation with top-down tracking.
+    Uses centroid + centered instance models for multi-animal tracking.
+    """
+    input:
+        video = rules.crop_video.output.cropped_video,
+        centroid_model = config["sleap"]["centroid_model"],
+        instance_model = config["sleap"]["instance_model"]
+    output:
+        predictions_slp = temp(BASE_PATH + "/{identity}/{day}/pipeline/pose/{identity}_{day}_predictions.slp")
+    priority: 100
+    params:
+        experiment_type = lambda wildcards: get_experiment_type(wildcards.identity),
+        batch_size = lambda wildcards: config["sleap"][get_experiment_type(wildcards.identity)]["batch_size"],
+        tracker = lambda wildcards: config["sleap"][get_experiment_type(wildcards.identity)]["tracker"],
+        max_tracks = lambda wildcards: config["sleap"][get_experiment_type(wildcards.identity)]["max_tracks"],
+        track_window = lambda wildcards: config["sleap"][get_experiment_type(wildcards.identity)]["track_window"],
+        gpu_device = config["sleap"].get("gpu_device", "0")
+    log:
+        BASE_PATH + "/{identity}/{day}/pipeline/logs/{identity}_{day}_sleap_inference.log"
+    benchmark:
+        BASE_PATH + "/{identity}/{day}/pipeline/benchmarks/{identity}_{day}_sleap_inference.txt"
+    threads: 4
+    resources:
+        mem_mb = 8000,
+        gpu = 1
+    run:
+        import subprocess
+        import os
+
+        ensure_output_dirs([output.predictions_slp, log[0]])
+
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(params.gpu_device)
+        env["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+        env["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
+
+        with open(log[0], 'w') as logfile:
+            logfile.write("=== SLEAP Inference Configuration ===\n")
+            logfile.write(f"Experiment type: {params.experiment_type}\n")
+            logfile.write(f"Max tracks: {params.max_tracks}\n")
+            logfile.write(f"Tracker: {params.tracker}\n")
+            logfile.write(f"Batch size: {params.batch_size}\n")
+            logfile.write(f"Track window: {params.track_window}\n")
+            logfile.write(f"CUDA_VISIBLE_DEVICES={params.gpu_device}\n")
+            logfile.write(f"TF_FORCE_GPU_ALLOW_GROWTH=true\n")
+
+            gpu_check = subprocess.run( #different for different versions of sleap.
+                ["conda", "run", "-n", "sleap", "python", "-c",
+                "import torch; print(f'PyTorch CUDA available: {torch.cuda.is_available()}'); "
+                "print(f'GPU count: {torch.cuda.device_count()}'); "
+                "[print(f'  GPU {i}: {torch.cuda.get_device_name(i)}') for i in range(torch.cuda.device_count())]"],
+                capture_output=True, text=True, env=env, shell=True
+            )
+            logfile.write(gpu_check.stdout)
+            if gpu_check.stderr:
+                logfile.write(gpu_check.stderr)
+            logfile.write("=========================\n\n")
+            logfile.flush()
+
+            cmd = [
+                "conda", "run", "-n", "sleap", "sleap-track",
+                str(input.video),
+                "-m", str(input.centroid_model),
+                "-m", str(input.instance_model),
+                "--batch_size", str(params.batch_size),
+                "--tracking.tracker", str(params.tracker),
+                "--tracking.max_tracking", "1",
+                "--tracking.max_tracks", str(params.max_tracks),
+                "--tracking.track_window", str(params.track_window),
+                # "--verbosity", "rich",
+                "-o", str(output.predictions_slp)
+            ]
+
+            logfile.write(f"Running: {' '.join(cmd)}\n\n")
+            logfile.flush()
+
+            result = subprocess.run(
+                cmd, env=env, stdout=logfile, stderr=subprocess.STDOUT, shell=True
+            )
+
+            if result.returncode != 0:
+                raise RuntimeError(f"SLEAP inference failed with return code {result.returncode}")
+
+
+rule sleap_export_csv:
+    """
+    Export SLEAP predictions to CSV format.
+    Supports both SLEAP 1.5.2+ and 1.4.1 legacy methods.
+    """
+    input:
+        cleaned_slp = rules.sleap_inference.output.predictions_slp
+    output:
+        raw_csv = BASE_PATH + "/{identity}/{day}/pipeline/pose/{identity}_{day}_raw_poses.csv"
+    priority: 3
+    log:
+        BASE_PATH + "/{identity}/{day}/pipeline/logs/{identity}_{day}_sleap_export.log"
+    threads: 1
+    run:
+        import subprocess
+        import os
+
+        ensure_output_dirs([output.raw_csv, log[0]])
+
+        cmd_new = [
+            "conda", "run", "-n", "sleap", "sleap-convert",
+            "--format", "analysis.csv",
+            "-o", str(output.raw_csv),
+            str(input.cleaned_slp)
+        ]
+
+        with open(log[0], 'w') as logfile:
+            logfile.write("=== SLEAP CSV Export ===\n")
+            logfile.write(f"Input: {input.cleaned_slp}\n")
+            logfile.write(f"Output: {output.raw_csv}\n")
+            logfile.write("=" * 50 + "\n\n")
+
+            logfile.write("Attempting SLEAP 1.5.2+ export method...\n")
+            logfile.write(f"Command: {' '.join(cmd_new)}\n\n")
+            logfile.flush()
+
+            result = subprocess.run(
+                cmd_new, stdout=logfile, stderr=subprocess.STDOUT, shell=True
+            )
+
+            if result.returncode != 0:
+                logfile.write("\n" + "=" * 50 + "\n")
+                logfile.write("SLEAP 1.5.2+ method failed. Trying SLEAP 1.4.1 legacy method...\n")
+                logfile.write("=" * 50 + "\n\n")
+                logfile.flush()
+
+                cmd_legacy = [
+                    "conda", "run", "-n", "sleap", "python",
+                    "scripts/sleap_legacy_export.py",
+                    str(input.cleaned_slp),
+                    str(output.raw_csv)
+                ]
+
+                logfile.write(f"Command: {' '.join(cmd_legacy)}\n\n")
+                logfile.flush()
+
+                result = subprocess.run(
+                    cmd_legacy, stdout=logfile, stderr=subprocess.STDOUT, shell=True
+                )
+
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        f"SLEAP CSV export failed with both methods. Check log: {log[0]}"
+                    )
+
+            logfile.write("\n" + "=" * 50 + "\n")
+            logfile.write("CSV export completed successfully\n")
+            logfile.write("=" * 50 + "\n")
+
+
+# =============================================================================
+# STAGE 4: EVENT CONVERSION (branches from crop_video, parallel with SLEAP)
+# =============================================================================
+
+rule event_convertor:
+    """
+    Convert event timestamps to frame indices using per-frame PTS data.
+
+    Loads events from configured sources (master scoring sheet, Bonsai, etc.)
+    and maps each timestamp to the nearest video frame with signed error.
+
+    Runs in parallel with SLEAP inference — both branch from crop_video.
+    """
+    input:
+        pts_csv = rules.crop_video.output.pts_csv,
+        metadata = rules.crop_video.output.metadata,
+        # Include scoring sheet as input so Snakemake tracks it
+        scoring_sheet = config["paths"]["master_scoring_sheet"]
+    output:
+        events_csv = BASE_PATH + "/{identity}/{day}/pipeline/events/{identity}_{day}_events.csv"
+    params:
+        sample = "{identity}_{day}",
+        event_sources = lambda wildcards: build_event_sources(wildcards)
+    log:
+        BASE_PATH + "/{identity}/{day}/pipeline/logs/{identity}_{day}_event_convertor.log"
+    benchmark:
+        BASE_PATH + "/{identity}/{day}/pipeline/benchmarks/{identity}_{day}_event_convertor.txt"
+    threads: 1
+    script:
+        "scripts/event_convertor.py"
+
+
+# =============================================================================
+# STAGE 5: POSE POST-PROCESSING
+# =============================================================================
+
+rule pose_postprocessing:
+    """
+    Post-process SLEAP predictions with identity swap correction.
+
+    For multi-animal tracking:
+    - Detects and corrects identity swaps
+    - Handles gaps in tracking
+    - Interpolates missing keypoints
+
+    For single animal:
+    - Simple interpolation of missing keypoints
+    """
+    input:
+        raw_csv = rules.sleap_export_csv.output.raw_csv,
+        metadata = rules.crop_video.output.metadata
+    output:
+        processed_csv = BASE_PATH + "/{identity}/{day}/pipeline/pose/{identity}_{day}_processed_poses.csv",
+        swap_report = BASE_PATH + "/{identity}/{day}/pipeline/qc/{identity}_{day}_swap_report.json"
+    priority: 4
+    params:
+        body_parts = config["pose"]["body_parts"],
+        interpolation_limit = config["pose"]["interpolation_limit"],
+        experiment_type = lambda wildcards: get_experiment_type(wildcards.identity)
+    log:
+        BASE_PATH + "/{identity}/{day}/pipeline/logs/{identity}_{day}_pose_postprocessing.log"
+    benchmark:
+        BASE_PATH + "/{identity}/{day}/pipeline/benchmarks/{identity}_{day}_pose_postprocessing.txt"
+    threads: 1
+    script:
+        "scripts/pose_postprocessing.py"
+
+
+# =============================================================================
+# STAGE 6: FEATURE EXTRACTION
+# =============================================================================
+
+rule feature_extraction:
+    """
+    Extract behavioral features from processed pose data.
+    """
+    input:
+        processed_csv = rules.pose_postprocessing.output.processed_csv,
+        metadata = rules.crop_video.output.metadata
+    output:
+        features_csv = BASE_PATH + "/{identity}/{day}/pipeline/features/{identity}_{day}_features.csv"
+    priority: 5
+    params:
+        roll_windows = config["features"]["rolling_windows"],
+        body_parts = config["pose"]["body_parts"],
+        experiment_type = lambda wildcards: get_experiment_type(wildcards.identity)
+    log:
+        BASE_PATH + "/{identity}/{day}/pipeline/logs/{identity}_{day}_feature_extraction.log"
+    benchmark:
+        BASE_PATH + "/{identity}/{day}/pipeline/benchmarks/{identity}_{day}_feature_extraction.txt"
+    threads: 2
+    resources:
+        mem_mb = 4000
+    script:
+        "scripts/feature_extraction.py"
+
+
+# =============================================================================
+# STAGE 7: ROI FEATURE EXTRACTION
+# =============================================================================
+
+rule roi_feature_extraction:
+    """
+    Add ROI-based features to extracted features.
+    """
+    input:
+        features_csv = rules.feature_extraction.output.features_csv,
+        roi_data = rules.crop_video.output.roi_data_cropped,
+        metadata = rules.crop_video.output.metadata
+    output:
+        features_with_roi = BASE_PATH + "/{identity}/{day}/pipeline/features/{identity}_{day}_features_with_roi.csv"
+    priority: 6
+    params:
+        body_parts = config["pose"]["body_parts"],
+        facing_angle_threshold = config["roi"]["facing_angle_threshold"],
+        px_per_mm = config["pose"]["default_pixel_to_mm"]
+    log:
+        BASE_PATH + "/{identity}/{day}/pipeline/logs/{identity}_{day}_roi_features.log"
+    threads: 2
+    script:
+        "scripts/roi_feature_extraction.py"
+
+
+# =============================================================================
+# STAGE 8: FEATURE ANALYSIS (merges ROI features + event CSV)
+# =============================================================================
+
+rule feature_analysis:
+    """
+    Event-oriented behavioral analysis around loom events.
+
+    Now uses the events CSV from event_convertor instead of directly
+    reading the master scoring sheet. This provides frame-accurate
+    event timing derived from per-frame PTS data.
+    """
+    input:
+        features_with_roi = rules.roi_feature_extraction.output.features_with_roi,
+        roi_data = rules.crop_video.output.roi_data_cropped,
+        metadata = rules.crop_video.output.metadata,
+        events_csv = rules.event_convertor.output.events_csv
+    output:
+        done_flag = BASE_PATH + "/{identity}/{day}/pipeline/analysis/{identity}_{day}_analysis.done"
+    priority: 7
+    params:
+        pixels_per_cm = config["pose"].get("default_pixels_per_cm", 32),
+        output_dir = BASE_PATH + "/{identity}/{day}/pipeline/analysis",
+        sample = "{identity}_{day}"
+    log:
+        BASE_PATH + "/{identity}/{day}/pipeline/logs/{identity}_{day}_analysis.log"
+    benchmark:
+        BASE_PATH + "/{identity}/{day}/pipeline/benchmarks/{identity}_{day}_analysis.txt"
+    threads: 1
+    script:
+        "scripts/feature_analysis.py"
+
+
+# =============================================================================
+# STAGE 9: ANALYSIS CORRECTION
+# =============================================================================
+
+rule analysis_correction:
+    """
+    Correct identity swaps in analysis output using manual scoring data.
+    Only runs for paired animal samples.
+    """
+    input:
+        analysis_done = rules.feature_analysis.output.done_flag,
+        scoring_sheet = config["paths"]["master_scoring_sheet"]
+    output:
+        done_flag = BASE_PATH + "/{identity}/{day}/pipeline/analysis/{identity}_{day}_correction.done"
+    priority: 8
+    params:
+        sample = "{identity}_{day}"
+    log:
+        BASE_PATH + "/{identity}/{day}/pipeline/logs/{identity}_{day}_correction.log"
+    benchmark:
+        BASE_PATH + "/{identity}/{day}/pipeline/benchmarks/{identity}_{day}_correction.txt"
+    threads: 1
+    script:
+        "scripts/analysis_correction.py"
+
+
+# =============================================================================
+# UTILITY RULES
+# =============================================================================
+
+rule generate_dag:
+    """Generate a visual representation of the workflow DAG"""
+    output:
+        dag = "workflow/dag.svg"
+    shell:
+        "snakemake --dag | dot -Tsvg > {output.dag}"
+
+
+rule clean:
+    """Remove all generated pipeline folders"""
+    run:
+        import shutil
+        from pathlib import Path
+        base = Path(config["paths"]["base_path"])
+        for identity_dir in base.iterdir():
+            if not identity_dir.is_dir():
+                continue
+            for day_dir in identity_dir.iterdir():
+                if not day_dir.is_dir():
+                    continue
+                pipeline_dir = day_dir / "pipeline"
+                if pipeline_dir.exists():
+                    print(f"Removing {pipeline_dir}")
+                    shutil.rmtree(pipeline_dir)
+
+
+report: "report/workflow_report.html"

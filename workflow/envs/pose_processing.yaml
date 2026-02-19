@@ -1,0 +1,54 @@
+# Pose Processing Conda Environment
+
+# This environment handles all non-SLEAP processing:
+# Video preprocessing (ROI detection, background generation)
+# Video cropping (ffmpeg operations)
+# Pose post-processing (identity tracking, coordinate transforms)
+# Feature extraction (behavioral metrics, circular statistics)
+# ROI analysis (spatial features)
+# Analysis pipeline (loom response analysis)
+# Event conversion
+# Plus Snakemake workflow orchestration
+
+name: pose_processing
+
+channels:
+- conda-forge
+- bioconda # For snakemake
+- defaults
+
+dependencies:
+# Core Python
+- python>=3.9,<3.13
+
+# Workflow management
+- snakemake>=7.0
+
+# Data processing
+- numpy>=1.21
+- pandas>=1.4
+- scipy>=1.8
+
+# Numerical acceleration
+- numba>=0.55
+
+# Computer vision
+- opencv>=4.5
+
+# Geometry and spatial analysis
+- shapely>=2.0
+
+# Video processing
+- ffmpeg>=4.4
+- ffmpeg-python>=0.2
+
+# File I/O
+- openpyxl>=3.0 # For Excel files (MasterScoringSheet)
+
+# Configuration
+- pyyaml>=6.0
+
+# Development/debugging
+- ipython>=8.0
+- pip
+- jupyter>=1.0

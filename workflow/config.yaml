@@ -1,0 +1,200 @@
+# Pose Estimation Pipeline Configuration
+
+# Author: June (Molas Lab)
+# Description: Configuration for behavioral video processing pipeline
+
+# File Paths
+
+paths:
+  # Base path containing the hierarchical folder structure:
+  #   {base_path}/{identity}/{day}/raw_data/{video}.mp4
+  # Pipeline outputs go to:
+  #   {base_path}/{identity}/{day}/pipeline/
+  # base_path: "Z:/Social_Looming/Behavior/5VLS_Singles"
+  base_path: "Z:/Social_Looming/Behavior/Quick_Test_Batch"
+  
+  # Master scoring sheet (Excel file with loom timing, etc.)
+  # master_scoring_sheet: "C:/Users/jjmmc/Downloads/MasterScoringSheet_1.xlsx"
+  master_scoring_sheet: "C:/Users/molaslab/Downloads/MasterScoringSheet_1.xlsx"
+
+  # ROI definition files (if using predefined ROIs)
+  roi_polygons: "resources/roi_polygons.csv"
+  roi_circles: "resources/roi_circles.csv"
+
+
+# Video Settings
+
+video:
+  # Supported video extensions
+  extensions:
+    - ".mp4"
+    - ".avi"
+    - ".mov"
+  
+  # Default extension when searching for videos
+  default_extension: "mp4"
+  
+  # Default FPS if cannot be extracted from video
+  default_fps: 29.595
+
+# Video Preprocessing
+
+preprocessing:
+  # Number of frames to sample for background extraction
+  background_frame_span: 600
+  
+  # Minimum ROI area as fraction of frame area
+  roi_min_area_ratio: 0.1
+  
+  # Canny edge detection thresholds
+  canny_threshold_low: 30
+  canny_threshold_high: 50
+  
+  # Whether to apply rotation correction
+  apply_rotation_correction: false
+
+
+# Event Sources Configuration
+# ============================
+# Defines where event timestamps come from. The event_convertor script
+# loads events from each configured source, maps timestamps to exact
+# frame indices using per-frame PTS data, and exports a unified events CSV.
+#
+# Each source specifies:
+#   - type: Parser name (master_scoring_sheet, bonsai_csv, etc.)
+#   - path OR path_key: Direct path or key into paths section
+#   - Additional parser-specific parameters
+#
+# Available parsers:
+#   master_scoring_sheet: Reads loom times from Excel scoring sheet
+#     - loom_session: auto-derived from sample name if not specified
+#   bonsai_csv: Reads events from Bonsai-generated CSV
+#     - event_type_column: Column name for event type (default: 'event_type')
+#     - time_column: Column name for timestamp (default: 'timestamp')
+#     - end_time_column: Optional column for event end time
+
+events:
+  sources:
+    - type: "master_scoring_sheet"
+      path_key: "master_scoring_sheet"  # Resolves to paths.master_scoring_sheet
+    # Example: Add Bonsai event source
+    # - type: "bonsai_csv"
+    #   path: "Z:/Social_Looming/Behavior/5VLS/bonsai_events.csv"
+    #   event_type_column: "event_type"
+    #   time_column: "timestamp"
+
+
+# SLEAP Configuration
+
+sleap:
+  # Inference parameters - Single Animal
+  single:
+    batch_size: 2
+    tracker: "simplemaxtracks"
+    max_tracks: 1
+    track_window: 3
+  
+  # Inference parameters - Paired Animals
+  paired:
+    batch_size: 2
+    tracker: "simplemaxtracks"
+    max_tracks: 2
+    track_window: 3
+
+  # Path to trained models
+  centroid_model: "C:/Users/molaslab/Documents/251201_171307.centroid.n=4997"
+  instance_model: "C:/Users/molaslab/Documents/251201_174829.centered_instance.n=4997"
+  
+  # GPU Configuration
+  gpu_device: "0"
+  gpu_memory_fraction: 0.95
+
+
+# Pose Processing
+
+pose:
+  # Body parts tracked (order matters for some functions)
+  body_parts:
+    - "nose"
+    - "ear_left"
+    - "ear_right"
+    - "head"
+    - "body_center"
+    - "tail_base"
+
+  # Maximum gap (frames) for interpolation
+  interpolation_limit: 90
+
+  # Pixel to millimeter conversion (calibrate per setup!)
+  default_pixel_to_mm: 1.47683
+
+  # Pixel to centimeter conversion (for velocity calculations in analysis)
+  default_pixels_per_cm: 32
+
+# Feature Extraction
+
+features:
+  # Rolling window sizes (in frames)
+  rolling_windows:
+    - 3
+    - 6
+    - 9
+    - 15
+  
+  # Features to extract (can be customized)
+  feature_groups:
+    - "distance"
+    - "velocity"
+    - "angular"
+    - "hull"
+    - "probability"
+
+# ROI Configuration
+
+roi:
+  # ROI types to detect
+  detect_roi_types:
+    - "trigger"
+    - "nest"
+    - "loom"
+
+  # Angle threshold for "facing" detection (degrees)
+  facing_angle_threshold: 45.0
+
+  # Use manual labeling (recommended) or automatic detection
+  use_manual_labeling: true
+
+  # Path to store manual ROI configurations (persists across runs)
+  manual_roi_config: "Z:/Social_Looming/Behavior/5VLS/manual_roi_config.json"
+
+  # Nest zone parameters (calculated from floor corners)
+  nest_percent_of_perspective: 0.2255
+  nest_buffer: 40
+
+  # Loom zone parameters (calculated from floor corners)
+  loom_percent_of_perspective: 0.1506
+  loom_radius: 32
+
+
+# Analysis Settings
+
+analysis:
+  # Velocity thresholds for freezing detection (cm/s)
+  freeze_start_velocity: 4
+  freeze_end_velocity: 3
+
+  # Enable analysis (requires events CSV from event_convertor)
+  enabled: true
+
+
+# Execution Settings
+
+execution:
+  # Number of parallel jobs
+  default_jobs: 4
+  
+  # Resource limits
+  max_memory_mb: 16000
+  
+  # Use SLURM cluster (set to true for HPC)
+  use_cluster: false
