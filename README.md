@@ -50,7 +50,7 @@ sleap-label --version
 ### 2. Install Pipeline Environment
 
 ```bash
-cd path/to/behavior_pipeline
+cd path/to/Pose-Based-Snakemake-Pipeline
 conda env create -f workflow/envs/poseprocessing.yml
 conda activate poseprocessing
 snakemake --version  # Should output 8.0.0 or higher
