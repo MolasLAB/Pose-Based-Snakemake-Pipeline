@@ -48,14 +48,13 @@ class SimbaTimer:
 
 @jit(nopython=True)
 def framewise_euclidean_distance_roi(location_1: np.ndarray,
-                                     location_2: np.ndarray,
-                                     px_per_mm: float) -> np.ndarray:
+                                     location_2: np.ndarray) -> np.ndarray:
     """
     Find frame-wise distances between a moving location and static ROI center in millimeters.
     """
     results = np.full((location_1.shape[0]), np.nan)
     for i in prange(location_1.shape[0]):
-        results[i] = np.linalg.norm(location_1[i] - location_2) / px_per_mm
+        results[i] = np.linalg.norm(location_1[i] - location_2)
     return results
 
 
@@ -195,8 +194,7 @@ def load_roi_from_json(roi_json_path: str) -> dict:
 class ROIFeatureExtractor:
     """Extract ROI-based features from pose estimation data"""
 
-    def __init__(self, px_per_mm: float = 1.47683):
-        self.px_per_mm = px_per_mm
+    def __init__(self):
         self.body_parts = BODY_PARTS
 
     def detect_animals_and_bodyparts(self, df: pd.DataFrame) -> Dict:
@@ -272,7 +270,7 @@ class ROIFeatureExtractor:
                     # Distance to center (SimBA format: "nest Animal_1 nose_1 distance")
                     dist_col = f"{roi_name} {animal_name} {bodypart_col_name} distance"
                     out_df[dist_col] = framewise_euclidean_distance_roi(
-                        bp_location, roi_center, self.px_per_mm
+                        bp_location, roi_center
                     )
 
                     # In-zone detection (SimBA format: "nest Animal_1 nose_1 in zone")
@@ -290,7 +288,7 @@ class ROIFeatureExtractor:
                     # Distance to center (SimBA format: "Loom Animal_1 nose_1 distance")
                     dist_col = f"{roi_name} {animal_name} {bodypart_col_name} distance"
                     out_df[dist_col] = framewise_euclidean_distance_roi(
-                        bp_location, roi_center, self.px_per_mm
+                        bp_location, roi_center
                     )
 
                     # In-zone detection (SimBA format: "Loom Animal_1 nose_1 in zone")
@@ -336,21 +334,13 @@ def main_snakemake(snakemake):
 
     input_csv = snakemake.input.features_csv
     roi_json = snakemake.input.roi_data
-    metadata_json = snakemake.input.metadata
     output_csv = snakemake.output.features_with_roi
-
-    # Load metadata for px_per_mm
-    with open(metadata_json, 'r') as f:
-        metadata = json.load(f)
-
-    # Use default px_per_mm from config or metadata
-    px_per_mm = snakemake.params.get('px_per_mm', 1.47683)
+    
 
     print("=" * 70)
     print("ROI FEATURE EXTRACTION (Snakemake Mode)")
     print("=" * 70)
     print(f"Configuration:")
-    print(f"  Pixels per mm: {px_per_mm}")
     print(f"  Input: {input_csv}")
     print(f"  ROI: {roi_json}")
     print(f"  Output: {output_csv}")
@@ -370,7 +360,7 @@ def main_snakemake(snakemake):
     print(f"  Found {len(rois['circles'])} circle(s) - Loom zones")
 
     # Initialize extractor
-    extractor = ROIFeatureExtractor(px_per_mm=px_per_mm)
+    extractor = ROIFeatureExtractor()
 
     # Detect animals and body parts
     print("\nDetecting animals and body parts...")

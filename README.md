@@ -300,10 +300,6 @@ insert later
 - Snakemake workflow management (https://snakemake.readthedocs.io/en/stable/)  - MIT License
 - SimBA for feature extraction concepts (https://github.com/sgoldenlab/simba) - BSD-3-Clause License
 
-## License
-
-[Specify license]
-
 ## Contact
 
 

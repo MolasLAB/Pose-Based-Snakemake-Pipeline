@@ -29,7 +29,6 @@ from math import degrees as mathdegrees
 
 # ==================== CONFIGURATION ====================
 
-PX_PER_MM = 1.47683
 FPS = 29.595
 ROLL_WINDOWS_VALUES = [3, 6, 9, 15]
 
@@ -128,12 +127,11 @@ def jitted_hull(points: np.ndarray, target: str = "perimeter") -> np.ndarray:
 def euclidean_distance(bp_1_x: np.ndarray,
                        bp_2_x: np.ndarray,
                        bp_1_y: np.ndarray,
-                       bp_2_y: np.ndarray,
-                       px_per_mm: float) -> np.ndarray:
+                       bp_2_y: np.ndarray) -> np.ndarray:
     """
-    Compute Euclidean distance in millimeters between two body-parts.
+    Compute Euclidean distance in pixels between two body-parts.
     """
-    series = (np.sqrt((bp_1_x - bp_2_x) ** 2 + (bp_1_y - bp_2_y) ** 2)) / px_per_mm
+    series = (np.sqrt((bp_1_x - bp_2_x) ** 2 + (bp_1_y - bp_2_y) ** 2))
     return series
 
 
@@ -314,8 +312,7 @@ def read_sleap_csv(file_path: str) -> pd.DataFrame:
 class FeatureExtractor:
     """Feature extractor for two-animal social behavior analysis"""
     
-    def __init__(self, px_per_mm: float = PX_PER_MM, fps: float = FPS):
-        self.px_per_mm = px_per_mm
+    def __init__(self,  fps: float = FPS):
         self.fps = fps
         self.roll_windows_values = ROLL_WINDOWS_VALUES
         self.angle3pt_serialized = angle3pt_vectorized
@@ -375,7 +372,6 @@ class FeatureExtractor:
         ).astype(np.float32)
         self.out_data["poly_area_1"] = (
             jitted_hull(points=mouse_1_ar, target="perimeter")
-            / self.px_per_mm
         )
         
         if self.paired:
@@ -385,7 +381,6 @@ class FeatureExtractor:
             ).astype(np.float32)
             self.out_data["poly_area_2"] = (
                 jitted_hull(points=mouse_2_ar, target="perimeter")
-                / self.px_per_mm
             )
         
         # Calculate distance features
@@ -395,7 +390,6 @@ class FeatureExtractor:
             self.out_data["tail_base_1_x"].values,
             self.out_data["nose_1_y"].values,
             self.out_data["tail_base_1_y"].values,
-            self.px_per_mm,
         )
         
         self.out_data["ear_distance_1"] = self.euclidean_distance(
@@ -403,7 +397,6 @@ class FeatureExtractor:
             self.out_data["ear_right_1_x"].values,
             self.out_data["ear_left_1_y"].values,
             self.out_data["ear_right_1_y"].values,
-            self.px_per_mm,
         )
         
         if self.paired:
@@ -412,49 +405,42 @@ class FeatureExtractor:
                 self.out_data["tail_base_2_x"].values,
                 self.out_data["nose_2_y"].values,
                 self.out_data["tail_base_2_y"].values,
-                self.px_per_mm,
             )
             self.out_data["ear_distance_2"] = self.euclidean_distance(
                 self.out_data["ear_left_2_x"].values,
                 self.out_data["ear_right_2_x"].values,
                 self.out_data["ear_left_2_y"].values,
                 self.out_data["ear_right_2_y"].values,
-                self.px_per_mm,
             )
             self.out_data["nose_to_nose_distance"] = self.euclidean_distance(
                 self.out_data["nose_1_x"].values,
                 self.out_data["nose_2_x"].values,
                 self.out_data["nose_1_y"].values,
                 self.out_data["nose_2_y"].values,
-                self.px_per_mm,
             )
             self.out_data["body_to_body_distance"] = self.euclidean_distance(
                 self.out_data["body_center_1_x"].values,
                 self.out_data["body_center_2_x"].values,
                 self.out_data["body_center_1_y"].values,
                 self.out_data["body_center_2_y"].values,
-                self.px_per_mm,
             )
             self.out_data["tail_to_tail_distance"] = self.euclidean_distance(
                 self.out_data["tail_base_1_x"].values,
                 self.out_data["tail_base_2_x"].values,
                 self.out_data["tail_base_1_y"].values,
                 self.out_data["tail_base_2_y"].values,
-                self.px_per_mm,
             )
             self.out_data["nose_1_to_tail_2_distance"] = self.euclidean_distance(
                 self.out_data["nose_1_x"].values,
                 self.out_data["tail_base_2_x"].values,
                 self.out_data["nose_1_y"].values,
                 self.out_data["tail_base_2_y"].values,
-                self.px_per_mm,
             )
             self.out_data["nose_2_to_tail_1_distance"] = self.euclidean_distance(
                 self.out_data["nose_2_x"].values,
                 self.out_data["tail_base_1_x"].values,
                 self.out_data["nose_2_y"].values,
                 self.out_data["tail_base_1_y"].values,
-                self.px_per_mm,
             )
         
         # Calculate angle features
@@ -556,7 +542,6 @@ class FeatureExtractor:
                     self.in_data[f"{feature_xy}_{animal_number}_x"].values,
                     self.in_data[f"{feature_xy}_{animal_number}_y_shifted"].values,
                     self.in_data[f"{feature_xy}_{animal_number}_y"].values,
-                    self.px_per_mm,
                 )
             
             for feature_s in individual_movement_features_1d:
@@ -589,16 +574,15 @@ class FeatureExtractor:
                 )
                 for animal, animal_name in zip([animal_1_dist, animal_2_dist], ["m1", "m2"]):
                     self.hull_dict[f"{animal_name}_hull_large_euclidean"].append(
-                        np.amax(animal, initial=0) / self.px_per_mm)
+                        np.amax(animal, initial=0))
                     self.hull_dict[f"{animal_name}_hull_small_euclidean"].append(
                         np.min(animal, initial=self.hull_dict[f"{animal_name}_hull_large_euclidean"][-1])
-                        / self.px_per_mm
                     )
                     self.hull_dict[f"{animal_name}_hull_mean_euclidean"].append(
-                        np.mean(animal) / self.px_per_mm
+                        np.mean(animal)
                     )
                     self.hull_dict[f"{animal_name}_hull_sum_euclidean"].append(
-                        np.sum(animal, initial=0) / self.px_per_mm
+                        np.sum(animal, initial=0)
                     )
             
             for k, v in self.hull_dict.items():
@@ -611,16 +595,15 @@ class FeatureExtractor:
                 animal_1_dist = animal_1_dist[animal_1_dist != 0]
                 for animal, animal_name in zip([animal_1_dist], ["m1"]):
                     self.hull_dict[f"{animal_name}_hull_large_euclidean"].append(
-                        np.amax(animal, initial=0) / self.px_per_mm)
+                        np.amax(animal, initial=0))
                     self.hull_dict[f"{animal_name}_hull_small_euclidean"].append(
                         np.min(animal, initial=self.hull_dict[f"{animal_name}_hull_large_euclidean"][-1])
-                        / self.px_per_mm
                     )
                     self.hull_dict[f"{animal_name}_hull_mean_euclidean"].append(
-                        np.mean(animal) / self.px_per_mm
+                        np.mean(animal)
                     )
                     self.hull_dict[f"{animal_name}_hull_sum_euclidean"].append(
-                        np.sum(animal, initial=0) / self.px_per_mm
+                        np.sum(animal, initial=0)
                     )
             
             for k, v in self.hull_dict.items():
@@ -869,14 +852,13 @@ def main_snakemake(snakemake):
     """
     import json
     
-    # Load metadata for FPS and px_per_mm
+    # Load metadata for FPS 
     with open(snakemake.input.metadata, 'r') as f:
         metadata = json.load(f)
     
     # Use metadata values with fallbacks to global defaults
-    global FPS, PX_PER_MM, ROLL_WINDOWS_VALUES,PAIRED
+    global FPS, ROLL_WINDOWS_VALUES,PAIRED
     FPS = metadata.get('fps', FPS)
-    PX_PER_MM = metadata.get('px_per_mm', PX_PER_MM)
     ROLL_WINDOWS_VALUES = snakemake.params.roll_windows
     PAIRED= snakemake.params.experiment_type
     
@@ -887,7 +869,6 @@ def main_snakemake(snakemake):
     print("FEATURE EXTRACTION (Snakemake Mode)")
     print("=" * 70)
     print(f"Configuration:")
-    print(f"  Pixels per mm: {PX_PER_MM}")
     print(f"  FPS: {FPS}")
     print(f"  Rolling windows: {ROLL_WINDOWS_VALUES}")
     print("=" * 70)
@@ -896,7 +877,7 @@ def main_snakemake(snakemake):
     in_data, _ = read_sleap_csv(input_path)
     
     # Extract features
-    extractor = FeatureExtractor(px_per_mm=PX_PER_MM, fps=FPS)
+    extractor = FeatureExtractor(fps=FPS)
     out_data = extractor.extract_features(in_data, (PAIRED == "paired"))
     
     # Convert to float32 to save space
@@ -932,7 +913,6 @@ def main_standalone():
     print("FEATURE EXTRACTION (Standalone Mode)")
     print("=" * 70)
     print(f"Configuration:")
-    print(f"  Pixels per mm: {PX_PER_MM}")
     print(f"  FPS: {FPS}")
     print(f"  Rolling windows: {ROLL_WINDOWS_VALUES}")
     print("=" * 70)
@@ -941,7 +921,7 @@ def main_standalone():
     in_data, paired = read_sleap_csv(input_path)
     
     # Extract features
-    extractor = FeatureExtractor(px_per_mm=PX_PER_MM, fps=FPS)
+    extractor = FeatureExtractor(fps=FPS)
     out_data = extractor.extract_features(in_data, paired)
     
     # Convert to float32 to save space and processing

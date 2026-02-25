@@ -37,9 +37,10 @@ from analysis_config_single import build_calculated_features_single
 
 
 # =============================================================================
-# EVENT LOADING (replaces direct scoring sheet access)
+# Data loading functions
 # =============================================================================
 
+# Event loading
 def load_loom_frames_from_events(events_csv: str) -> List[int]:
     """
     Load loom event frame indices from the events CSV produced by event_convertor.
@@ -69,6 +70,30 @@ def load_loom_frames_from_events(events_csv: str) -> List[int]:
 
     return loom_frames
 
+# Load and calculate px per cm for analysis 
+def compute_pixels_per_cm(roi_json_path: str, arena_height_cm: float, default_pixels_per_cm) -> float:
+    """Compute px/cm from average of left (TL→BL) and right (TR→BR) floor side lengths."""
+    try:
+        with open(roi_json_path, 'r') as f:
+            roi_data = json.load(f)
+
+        floor_pts = next(
+            (np.array(r['floor']) for r in roi_data.get('regions', []) if 'floor' in r), None
+        )
+
+        if floor_pts is None or len(floor_pts) != 4:
+            warnings.warn(f"Floor corners missing in {roi_json_path}. Falling back to default={default_pixels_per_cm}.", RuntimeWarning)
+            return default_pixels_per_cm
+
+        TL, TR, BR, BL = floor_pts
+        avg_height_px = (np.linalg.norm(BL - TL) + np.linalg.norm(BR - TR)) / 2.0
+        pixels_per_cm = avg_height_px / arena_height_cm
+        print(f"  [px/cm] Avg floor height: {avg_height_px:.1f}px → {pixels_per_cm:.3f} px/cm")
+        return pixels_per_cm
+
+    except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
+        warnings.warn(f"Could not compute pixels_per_cm from ROI JSON ({e}). Falling back to default={default_pixels_per_cm}.", RuntimeWarning)
+        return default_pixels_per_cm
 
 # =============================================================================
 # MAIN ANALYZER CLASS
@@ -101,7 +126,7 @@ class AnimalBehaviorAnalyzer:
                  events_csv: str,
                  animal_ids: tuple,
                  output_directory: str,
-                 pixels_per_cm: float = 32,
+                 pixels_per_cm: float,
                  start_velocity: float = 4,
                  end_velocity: float = 3):
         """
@@ -769,8 +794,14 @@ def main_snakemake(snakemake):
     animal_ids = extract_animal_ids_from_sample(sample_name)
 
     # Get parameters
-    pixels_per_cm = snakemake.params.get('pixels_per_cm', 32)
+    arena_height_cm = snakemake.params.get('arena_height_cm')  # add this to config.yaml + snakemake rule
+    default_pixels_per_cm = snakemake.params.get('default_pixels_per_cm')
 
+    pixels_per_cm = compute_pixels_per_cm(
+        roi_json_path=roi_json,
+        arena_height_cm=arena_height_cm,
+        default_pixels_per_cm=default_pixels_per_cm
+    )
     print(f"  Sample: {sample_name}")
     print(f"  Animals: {animal_ids}")
     print(f"  Experiment type: {'Paired' if len(animal_ids) == 2 else 'Single'}")

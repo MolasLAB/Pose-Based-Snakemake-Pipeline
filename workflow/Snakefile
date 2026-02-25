@@ -528,15 +528,13 @@ rule roi_feature_extraction:
     """
     input:
         features_csv = rules.feature_extraction.output.features_csv,
-        roi_data = rules.crop_video.output.roi_data_cropped,
-        metadata = rules.crop_video.output.metadata
+        roi_data = rules.crop_video.output.roi_data_cropped
     output:
         features_with_roi = BASE_PATH + "/{identity}/{day}/pipeline/features/{identity}_{day}_features_with_roi.csv"
     priority: 6
     params:
         body_parts = config["pose"]["body_parts"],
-        facing_angle_threshold = config["roi"]["facing_angle_threshold"],
-        px_per_mm = config["pose"]["default_pixel_to_mm"]
+        facing_angle_threshold = config["roi"]["facing_angle_threshold"]
     log:
         BASE_PATH + "/{identity}/{day}/pipeline/logs/{identity}_{day}_roi_features.log"
     threads: 2
@@ -565,7 +563,8 @@ rule feature_analysis:
         done_flag = BASE_PATH + "/{identity}/{day}/pipeline/analysis/{identity}_{day}_analysis.done"
     priority: 7
     params:
-        pixels_per_cm = config["pose"].get("default_pixels_per_cm", 32),
+        default_pixels_per_cm = config["pose"].get("default_pixels_per_cm"),
+        arena_height_cm = config["analysis"].get("arena_height_cm"),
         output_dir = BASE_PATH + "/{identity}/{day}/pipeline/analysis",
         sample = "{identity}_{day}"
     log:

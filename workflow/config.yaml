@@ -46,11 +46,12 @@ preprocessing:
   roi_min_area_ratio: 0.1
   
   # Canny edge detection thresholds
+  
   canny_threshold_low: 30
   canny_threshold_high: 50
   
   # Whether to apply rotation correction
-  apply_rotation_correction: false
+  apply_rotation_correction: true
 
 
 # Event Sources Configuration
@@ -124,11 +125,8 @@ pose:
   # Maximum gap (frames) for interpolation
   interpolation_limit: 90
 
-  # Pixel to millimeter conversion (calibrate per setup!)
-  default_pixel_to_mm: 1.47683
-
   # Pixel to centimeter conversion (for velocity calculations in analysis)
-  default_pixels_per_cm: 32
+  default_pixels_per_cm: 14.5
 
 # Feature Extraction
 
@@ -184,6 +182,9 @@ analysis:
 
   # Enable analysis (requires events CSV from event_convertor)
   enabled: true
+
+  # 
+  arena_height_cm: 60
 
 
 # Execution Settings
