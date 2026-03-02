@@ -1,597 +1,822 @@
 #!/usr/bin/env python3
 """
-Video Preprocessing Script for Behavioral Pipeline
-Handles ROI definition (manual or automatic) and background image generation.
+Video Cropping and Metadata Extraction Script
 
 This script:
-1. Generates a representative background image via median/mean filtering (OpenCV only)
-2. Defines behavioral arena ROI (manual GUI labeling or automatic detection)
-3. Calculates nest and loom zones from the arena corners
-4. Outputs ROI JSON and visualization image
+1. Reads ROI corner coordinates from JSON
+2. Calculates H.264-compliant crop parameters (macroblock alignment)
+3. Crops video using ffmpeg with specified threading
+4. Probes the cropped video for metadata (fps, resolution, duration)
+5. Extracts per-frame PTS timestamps via ffprobe (for VFR-accurate frame mapping)
+6. Outputs metadata JSON and PTS CSV alongside the cropped video
 
-Note: Video metadata extraction and frame timestamp probing are handled
-downstream by crop_video.py (post-crop ffprobe), keeping this script
-focused on the interactive/sequential ROI labeling phase.
+The PTS extraction is critical for variable-frame-rate (VFR) videos where
+frame timing is non-uniform. Downstream scripts (event_convertor.py) use
+the PTS list to map event timestamps to exact frame indices.
 
 Author: June (Molas Lab)
-Integrated for Snakemake pipeline
 """
 
-import os
 import sys
+import os
 import json
+import subprocess
+import csv
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import Dict, Tuple, Optional, List
-
-# Add library path for robust_roi_detection
-sys.path.append(str(Path(__file__).parent.parent.parent / 'lib'))
-from robust_roi_detection import TrapBoxDetector
 
 
 # =============================================================================
-# BACKGROUND IMAGE GENERATION (OpenCV only no ffmpeg)
+# ROTATION UTILITIES
 # =============================================================================
 
-def generate_background(video_path: str, frame_span: int = 3600,
-                       use_median: bool = False) -> np.ndarray:
+def compute_rotation_angle(roi_json_path: str, rotation_threshold: float) -> float:
     """
-    Generate representative background image by sampling frames across video.
+    Compute the rotation correction angle from the TL->BL edge of the floor polygon.
 
-    Uses mean by default (faster) with median as option (more robust to moving objects).
-    Uses OpenCV only  no ffmpeg/ffprobe dependency.
+    The floor polygon is stored as [TL, TR, BR, BL] (indices 0, 1, 2, 3).
+    A perfectly vertical left edge would have TL directly above BL (same x).
+    We measure the signed angle between TL->BL and the downward vertical (+Y axis),
+    then return the correction angle needed to bring that edge to vertical.
+
+    A positive return value means the video needs to rotate clockwise (positive
+    degrees in FFmpeg's rotate filter, which rotates counter-clockwise by default,
+    so we negate it when building the filter string).
+
+    Args:
+        roi_json_path: Path to ROI JSON file (new 'regions' format)
+        rotation_threshold: Minimum angle magnitude (degrees) to trigger correction
+
+    Returns:
+        Correction angle in degrees. 0.0 if below threshold or correction disabled.
+        Positive = camera tilted clockwise (needs CCW correction).
+    """
+    with open(roi_json_path, 'r') as f:
+        roi_data = json.load(f)
+
+    if 'regions' not in roi_data or len(roi_data['regions']) == 0:
+        raise KeyError("ROI JSON must contain 'regions' key for rotation detection")
+
+    floor = np.array(roi_data['regions'][0]['floor'])  # [TL, TR, BR, BL]
+    if floor.shape[0] < 4:
+        raise ValueError(f"Floor polygon must have 4 corners, got {floor.shape[0]}")
+
+    tl = floor[0]  # index 0 = TL
+    bl = floor[3]  # index 3 = BL
+
+    # Vector from TL to BL (should point straight down if perfectly vertical)
+    dx = bl[0] - tl[0]
+    dy = bl[1] - tl[1]  # positive y is downward in image coordinates
+
+    # Angle of TL->BL vector from the downward vertical (+Y axis)
+    # atan2(dx, dy): zero when dx=0 (perfectly vertical), positive when tilted right
+    angle_rad = np.arctan2(dx, dy)
+    angle_deg = np.degrees(angle_rad)
+
+    print(f"  TL: {tl}, BL: {bl}")
+    print(f"  TL->BL vector: ({dx:.2f}, {dy:.2f})")
+    print(f"  Deviation from vertical: {angle_deg:.3f} degrees")
+
+    if abs(angle_deg) < rotation_threshold:
+        print(f"  Angle {abs(angle_deg):.2f}° < threshold {rotation_threshold}°, skipping rotation")
+        return 0.0
+
+    print(f"  Rotation correction required: {angle_deg:.3f}°")
+    return float(angle_deg)
+
+
+def compute_expanded_canvas(orig_w: int, orig_h: int, angle_deg: float) -> tuple:
+    """
+    Compute the expanded canvas dimensions after FFmpeg's rotate+expand.
+
+    FFmpeg expand=1 uses:
+        new_w = |w*cos(θ)| + |h*sin(θ)|
+        new_h = |w*sin(θ)| + |h*cos(θ)|
+
+    Args:
+        orig_w, orig_h: Original video dimensions
+        angle_deg: Rotation angle in degrees (the angle applied to the video,
+                   i.e. the negation of the correction angle)
+
+    Returns:
+        (expanded_w, expanded_h, pad_x, pad_y) where pad_x/pad_y is the shift
+        of the original content centre into the new canvas.
+    """
+    theta = np.radians(abs(angle_deg))
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+
+    expanded_w = int(np.ceil(orig_w * cos_t + orig_h * sin_t))
+    expanded_h = int(np.ceil(orig_w * sin_t + orig_h * cos_t))
+
+    # FFmpeg centres the rotated image in the expanded canvas
+    pad_x = (expanded_w - orig_w) / 2.0
+    pad_y = (expanded_h - orig_h) / 2.0
+
+    return expanded_w, expanded_h, pad_x, pad_y
+
+
+def rotate_point(pt: np.ndarray, cx: float, cy: float, angle_deg: float) -> np.ndarray:
+    """
+    Rotate a 2D point around (cx, cy) by angle_deg degrees.
+
+    Positive angle = counter-clockwise in standard maths, but image y-axis is
+    inverted, so positive angle here rotates clockwise in image space — matching
+    FFmpeg's rotate filter convention (positive angle = clockwise rotation of content).
+
+    Args:
+        pt: [x, y] array
+        cx, cy: Centre of rotation
+        angle_deg: Rotation angle in degrees (positive = clockwise in image space)
+
+    Returns:
+        Rotated [x, y] array
+    """
+    theta = np.radians(angle_deg)
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+
+    # Translate to origin
+    x = pt[0] - cx
+    y = pt[1] - cy
+
+    # Rotate (clockwise in image space: y-axis inverted)
+    x_rot = cos_t * x + sin_t * y
+    y_rot = -sin_t * x + cos_t * y
+
+    return np.array([x_rot + cx, y_rot + cy])
+
+
+# =============================================================================
+# VIDEO PROBING
+# =============================================================================
+
+def get_video_dimensions(video_path: str) -> tuple:
+    """Get video width and height using ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "csv=p=0",
+        video_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe failed: {result.stderr}")
+    width, height = map(int, result.stdout.strip().split(','))
+    return width, height
+
+
+def extract_stream_metadata(video_path: str) -> dict:
+    """
+    Extract stream-level metadata from a video file using ffprobe.
+
+    Returns dict with:
+        - width, height: Resolution
+        - fps_nominal: r_frame_rate (max playback rate)
+        - duration_sec: Stream duration
+        - codec_name: Video codec
+
+    Note: frame_count and average fps are derived after PTS extraction,
+    since nb_frames is unreliable for VFR content.
+    """
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,r_frame_rate,duration,codec_name,nb_frames",
+        "-of", "json",
+        video_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe metadata extraction failed: {result.stderr}")
+
+    probe = json.loads(result.stdout)
+    stream = probe['streams'][0]
+
+    # Parse r_frame_rate (may be fraction like "30000/1001")
+    fps_str = stream.get('r_frame_rate', '0/1')
+    if '/' in fps_str:
+        num, den = fps_str.split('/')
+        fps_nominal = float(num) / float(den) if float(den) != 0 else 0.0
+    else:
+        fps_nominal = float(fps_str)
+
+    # Duration ffprobe may report it at stream or format level
+    duration = float(stream.get('duration', 0))
+    if duration == 0:
+        # Fallback: probe format-level duration
+        cmd_fmt = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            video_path
+        ]
+        res = subprocess.run(cmd_fmt, capture_output=True, text=True)
+        if res.returncode == 0 and res.stdout.strip():
+            duration = float(res.stdout.strip())
+
+    # nb_frames may be "N/A" for VFR
+    nb_frames_str = stream.get('nb_frames', '0')
+    try:
+        nb_frames = int(nb_frames_str)
+    except (ValueError, TypeError):
+        nb_frames = 0  # Will be populated from PTS count
+
+    return {
+        'width': int(stream['width']),
+        'height': int(stream['height']),
+        'fps_nominal': fps_nominal,
+        'duration_sec': duration,
+        'codec_name': stream.get('codec_name', 'unknown'),
+        'nb_frames_header': nb_frames,
+        'video_path': video_path
+    }
+
+
+def extract_frame_pts(video_path: str) -> list:
+    """
+    Extract per-frame presentation timestamps (PTS) from a video using ffprobe.
+
+    This reads container-level packet timestamps WITHOUT decoding frames,
+    making it fast even for long videos (~seconds for 30-min video).
 
     Args:
         video_path: Path to video file
-        frame_span: Maximum number of frames to sample from (default 3600 = ~2min @ 30fps)
-        use_median: Use median instead of mean (slower but more robust)
 
     Returns:
-        np.ndarray: Background image (H, W, 3)
+        List of PTS values in seconds, ordered by frame index.
+        Length equals the actual frame count in the video.
     """
-    cap = cv2.VideoCapture(video_path)
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "frame=best_effort_timestamp_time",
+        "-of", "csv=p=0",
+        video_path
+    ]
 
+    print(f"  Extracting per-frame PTS timestamps...")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe PTS extraction failed: {result.stderr}")
+
+    pts_list = []
+    for line in result.stdout.strip().split('\n'):
+        line = line.strip()
+        if line:
+            try:
+                pts_list.append(float(line))
+            except ValueError:
+                # Skip malformed lines (e.g., "N/A")
+                continue
+
+    print(f"  Extracted {len(pts_list)} frame timestamps")
+    return pts_list
+
+
+# =============================================================================
+# CROP PARAMETER CALCULATION
+# =============================================================================
+
+def calculate_crop_params(roi_json_path: str, video_width: int, video_height: int,
+                         macroblock_size: int = 16, buffer: int = 50) -> dict:
+    """
+    Calculate ffmpeg crop parameters from ROI JSON.
+
+    The crop origin (crop_x, crop_y) is the top-left corner of the cropped
+    region in original video coordinates. Macroblock rounding only affects
+    width/height (truncated from the bottom-right), NOT the origin.
+
+    Args:
+        roi_json_path: Path to ROI JSON file
+        video_width: Original video width
+        video_height: Original video height
+        macroblock_size: H.264 macroblock size (default 16)
+        buffer: Pixel buffer around ROI (default 1)
+
+    Returns:
+        Dict with crop_string ("w:h:x:y"), crop_x, crop_y, crop_w, crop_h
+    """
+    with open(roi_json_path, 'r') as f:
+        roi = json.load(f)
+
+    # Get corners  support both old format and new format
+    if 'corners' in roi:
+        corners = np.array(roi['corners'])
+    elif 'regions' in roi and len(roi['regions']) > 0 and 'floor' in roi['regions'][0]:
+        corners = np.array(roi['regions'][0]['floor'])
+    else:
+        raise KeyError("ROI JSON must contain either 'corners' or 'regions[0].floor'")
+
+    # Calculate bounding box
+    x_min = int(corners[:, 0].min()) - buffer
+    y_min = int(corners[:, 1].min()) - buffer
+    x_max = int(corners[:, 0].max()) + buffer
+    y_max = int(corners[:, 1].max()) + buffer
+
+    # Clamp to video bounds
+    x_min = max(0, x_min)
+    y_min = max(0, y_min)
+    x_max = min(video_width, x_max)
+    y_max = min(video_height, y_max)
+
+    # Calculate dimensions
+    width = x_max - x_min
+    height = y_max - y_min
+
+    # Round to macroblock boundaries (required for H.264)
+    width = (width // macroblock_size) * macroblock_size
+    height = (height // macroblock_size) * macroblock_size
+
+    # Ensure minimum size
+    width = max(width, macroblock_size)
+    height = max(height, macroblock_size)
+
+    # Ensure we don't exceed video bounds after rounding
+    if x_min + width > video_width:
+        width = ((video_width - x_min) // macroblock_size) * macroblock_size
+    if y_min + height > video_height:
+        height = ((video_height - y_min) // macroblock_size) * macroblock_size
+
+    return {
+        'crop_string': f"{width}:{height}:{x_min}:{y_min}",
+        'crop_x': x_min,
+        'crop_y': y_min,
+        'crop_w': width,
+        'crop_h': height,
+    }
+
+
+# =============================================================================
+# MAIN CROP + PROBE WORKFLOW
+# =============================================================================
+
+def crop_video(input_video: str, roi_json: str, output_video: str, threads: int = 4,
+               apply_rotation_correction: bool = False, rotation_threshold: float = 10.0):
+    """
+    Crop video using ffmpeg based on ROI coordinates, with optional rotation correction.
+
+    When rotation correction is enabled, the pipeline:
+      1. Measures the deviation of the TL->BL floor edge from vertical.
+      2. If the deviation exceeds rotation_threshold, injects a rotate+expand filter
+         before the crop. The crop origin is adjusted for the expanded canvas.
+      3. Returns a crop_result dict that includes rotation metadata so downstream
+         ROI coordinate transforms can apply the same rotation to all polygons.
+
+    Args:
+        input_video: Path to input video
+        roi_json: Path to ROI JSON file
+        output_video: Path to output cropped video
+        threads: Number of ffmpeg threads
+        apply_rotation_correction: Whether to check and apply rotation correction
+        rotation_threshold: Minimum angle deviation (degrees) that triggers correction
+    """
+    if not os.path.isfile(input_video):
+        raise FileNotFoundError(f"Input video not found: {input_video}")
+    if not os.path.isfile(roi_json):
+        raise FileNotFoundError(f"ROI JSON not found: {roi_json}")
+
+    Path(output_video).parent.mkdir(parents=True, exist_ok=True)
+
+    video_width, video_height = get_video_dimensions(input_video)
+    print(f"  Video dimensions: {video_width}x{video_height}")
+
+    # --- Rotation detection ---
+    correction_angle = 0.0
+    pad_x = pad_y = 0.0
+    expanded_w, expanded_h = video_width, video_height
+    ffmpeg_rotate_angle = 0.0  # angle passed to FFmpeg (negated correction, in radians)
+
+    if apply_rotation_correction:
+        print("\n  [Rotation correction enabled]")
+        correction_angle = compute_rotation_angle(roi_json, rotation_threshold)
+
+        if correction_angle != 0.0:
+            # FFmpeg rotate filter: positive angle = counter-clockwise.
+            # Our correction_angle is the clockwise tilt of the camera, so to
+            # correct it we rotate the video counter-clockwise by correction_angle,
+            # which means passing +correction_angle to FFmpeg's rotate filter.
+            ffmpeg_rotate_angle = correction_angle  # degrees; converted to radians below
+            expanded_w, expanded_h, pad_x, pad_y = compute_expanded_canvas(
+                video_width, video_height, ffmpeg_rotate_angle
+            )
+            print(f"  Expanded canvas: {expanded_w}x{expanded_h} "
+                  f"(pad: {pad_x:.1f}, {pad_y:.1f})")
+
+    # --- Crop parameter calculation (in original video space) ---
+    # calculate_crop_params computes the bounding box in original coordinates.
+    # If rotation is applied, the crop origin must be shifted by the canvas padding.
+    crop_result = calculate_crop_params(roi_json, video_width, video_height)
+
+    if correction_angle != 0.0:
+        # Adjust crop origin for the expanded canvas
+        adjusted_x = int(round(crop_result['crop_x'] + pad_x))
+        adjusted_y = int(round(crop_result['crop_y'] + pad_y))
+        crop_result['crop_string'] = (
+            f"{crop_result['crop_w']}:{crop_result['crop_h']}:{adjusted_x}:{adjusted_y}"
+        )
+        crop_result['crop_x_adjusted'] = adjusted_x
+        crop_result['crop_y_adjusted'] = adjusted_y
+        print(f"  Adjusted crop origin for expanded canvas: ({adjusted_x}, {adjusted_y})")
+    else:
+        crop_result['crop_x_adjusted'] = crop_result['crop_x']
+        crop_result['crop_y_adjusted'] = crop_result['crop_y']
+
+    crop_params = crop_result['crop_string']
+    print(f"  Crop parameters: {crop_params}")
+    print(f"  Input: {input_video}")
+    print(f"  Output: {output_video}")
+    print(f"  Threads: {threads}")
+
+    # --- Build FFmpeg filter chain ---
+    if correction_angle != 0.0:
+        angle_rad = np.radians(ffmpeg_rotate_angle)
+        # rotate filter: angle in radians, expand=1 to avoid clipping
+        vf = f"rotate={angle_rad:.8f}:expand=1,crop={crop_params}"
+        print(f"  FFmpeg filter: {vf}")
+    else:
+        vf = f"crop={crop_params}"
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_video,
+        "-vf", vf,
+        "-threads", str(threads),
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "18",
+        output_video
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"ffmpeg stderr: {result.stderr}")
+        raise RuntimeError(f"ffmpeg failed with return code {result.returncode}")
+
+    print(f"  Video cropped successfully: {output_video}")
+
+    # Store rotation metadata for downstream ROI transforms
+    crop_result['rotation'] = {
+        'applied': correction_angle != 0.0,
+        'correction_angle_deg': correction_angle,
+        'ffmpeg_angle_deg': ffmpeg_rotate_angle,
+        'original_w': video_width,
+        'original_h': video_height,
+        'expanded_w': expanded_w,
+        'expanded_h': expanded_h,
+        'pad_x': pad_x,
+        'pad_y': pad_y,
+    }
+
+    return crop_result
+
+
+def probe_cropped_video(cropped_video: str, metadata_path: str, pts_csv_path: str,
+                        crop_result: dict = None):
+    """
+    Probe the cropped video to extract metadata and per-frame PTS timestamps.
+
+    This runs AFTER cropping and is fast (reads packet headers, no decoding).
+
+    Args:
+        cropped_video: Path to the cropped video
+        metadata_path: Path to write metadata JSON
+        pts_csv_path: Path to write per-frame PTS CSV
+        crop_result: Dict from calculate_crop_params (stored in metadata for reference)
+    """
+    print("\n  [Probing cropped video]")
+
+    # Extract stream metadata
+    metadata = extract_stream_metadata(cropped_video)
+
+    # Extract per-frame PTS
+    pts_list = extract_frame_pts(cropped_video)
+
+    # Derive accurate frame count and average FPS from PTS
+    frame_count = len(pts_list)
+    if frame_count >= 2:
+        total_duration_pts = pts_list[-1] - pts_list[0]
+        # Average FPS from actual frame timing
+        fps_average = (frame_count - 1) / total_duration_pts if total_duration_pts > 0 else metadata['fps_nominal']
+    else:
+        fps_average = metadata['fps_nominal']
+
+    # Compute inter-frame intervals for VFR characterization
+    if frame_count >= 2:
+        intervals = np.diff(pts_list)
+        ifi_mean = float(np.mean(intervals))
+        ifi_std = float(np.std(intervals))
+        ifi_min = float(np.min(intervals))
+        ifi_max = float(np.max(intervals))
+    else:
+        ifi_mean = ifi_std = ifi_min = ifi_max = 0.0
+
+    # Assemble final metadata
+    if crop_result is not None:
+        metadata['crop_offset'] = {
+            'x': crop_result['crop_x'],
+            'y': crop_result['crop_y'],
+            'x_adjusted': crop_result.get('crop_x_adjusted', crop_result['crop_x']),
+            'y_adjusted': crop_result.get('crop_y_adjusted', crop_result['crop_y']),
+            'w': crop_result['crop_w'],
+            'h': crop_result['crop_h'],
+        }
+        if 'rotation' in crop_result:
+            metadata['rotation_correction'] = crop_result['rotation']
+
+    metadata['frame_count'] = frame_count
+    metadata['fps'] = fps_average
+    metadata['vfr_stats'] = {
+        'ifi_mean_sec': ifi_mean,
+        'ifi_std_sec': ifi_std,
+        'ifi_min_sec': ifi_min,
+        'ifi_max_sec': ifi_max,
+        'is_vfr': ifi_std > (ifi_mean * 0.01) if ifi_mean > 0 else False
+    }
+
+    # Save metadata JSON
+    Path(metadata_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(metadata_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    print(f"  [OK] Metadata: {metadata_path}")
+    print(f"    - Resolution: {metadata['width']}x{metadata['height']}")
+    print(f"    - Frame count: {frame_count}")
+    print(f"    - FPS (average): {fps_average:.4f}")
+    print(f"    - FPS (nominal): {metadata['fps_nominal']:.4f}")
+    print(f"    - Duration: {metadata['duration_sec']:.2f}s")
+    print(f"    - VFR: {'Yes' if metadata['vfr_stats']['is_vfr'] else 'No'} "
+          f"(IFI std={ifi_std*1000:.3f}ms)")
+
+    # Save PTS as CSV: frame_idx, pts_seconds
+    Path(pts_csv_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(pts_csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['frame_idx', 'pts_seconds'])
+        for idx, pts in enumerate(pts_list):
+            writer.writerow([idx, f"{pts:.6f}"])
+
+    print(f"  [OK] PTS timestamps: {pts_csv_path} ({frame_count} frames)")
+
+
+# =============================================================================
+# ENTRY POINTS
+# =============================================================================
+
+
+def generate_cropped_representative_image(cropped_video: str, roi_json_path: str,
+                                           output_image_path: str):
+    """
+    Generate a representative image from the cropped video with ROI overlay.
+
+    Extracts a background frame from the cropped video and draws all ROI zones
+    (floor, nest, loom) using the already-transformed coordinates. This produces
+    a QC image that matches the coordinate space of the actual analysis.
+
+    Args:
+        cropped_video: Path to the cropped video
+        roi_json_path: Path to ROI JSON (must already be in cropped space)
+        output_image_path: Path to write the visualization JPEG
+    """
+    # Extract a representative frame from the cropped video
+    cap = cv2.VideoCapture(cropped_video)
     if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {video_path}")
+        print(f"  WARNING: Could not open cropped video for representative image")
+        return
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Determine sampling strategy
-    if total_frames < frame_span:
-        print(f"  Video ({total_frames} frames) shorter than frame_span ({frame_span})")
-        sample_interval = max(1, total_frames // 30)  # Sample ~30 frames
-    else:
-        sample_interval = 30  # Sample every 30 frames
-
-    # Sample frames
+    # Sample frames for a mean background (same approach as video_preprocessing)
     sampled_frames = []
+    sample_interval = max(1, min(total_frames, 3600) // 30)
     frame_idx = 0
 
-    while cap.isOpened() and frame_idx < min(frame_span, total_frames):
+    while cap.isOpened() and frame_idx < min(3600, total_frames):
         ret, frame = cap.read()
         if not ret:
             break
-
         if frame_idx % sample_interval == 0:
             sampled_frames.append(frame)
-
         frame_idx += 1
 
     cap.release()
 
     if len(sampled_frames) == 0:
-        raise RuntimeError("No frames sampled from video")
+        print(f"  WARNING: No frames sampled from cropped video")
+        return
 
-    print(f"  Sampled {len(sampled_frames)} frames for background generation")
+    background = np.mean(np.array(sampled_frames), axis=0).astype(np.uint8)
+    print(f"  Background from cropped video: {background.shape} ({len(sampled_frames)} frames sampled)")
 
-    # Compute background
-    frames_array = np.array(sampled_frames)
+    # Load ROI data (already in cropped space)
+    with open(roi_json_path, 'r') as f:
+        roi_data = json.load(f)
 
-    if use_median:
-        background = np.median(frames_array, axis=0).astype(np.uint8)
-    else:
-        background = np.mean(frames_array, axis=0).astype(np.uint8)
-
-    return background
-
-
-# =============================================================================
-# NEST AND LOOM ZONE CALCULATIONS
-# =============================================================================
-
-def nest_calculator(f_pts: np.ndarray, percent_of_perspective: float = 0.1955,
-                   buffer: float = 80) -> np.ndarray:
-    """
-    Calculate nest zone from floor corners using original algorithm.
-
-    This is a hard coded calculation of where the nest should be given the floor's corners.
-    The rectangle's points are defined as:
-    0-1
-    | |
-    3-2
-
-    Args:
-        f_pts: Floor corners as 4x2 array [TL, TR, BR, BL] (CW from top-left, COCO standard)
-        percent_of_perspective: Percentage down from top for nest placement (default 0.1955)
-        buffer: Buffer distance from floor edges (default 80 pixels)
-
-    Returns:
-        np.ndarray: 4x2 array of nest corners [TL, TR, BR, BL] (CW from top-left)
-    """
-    nest_rect = np.zeros((4, 2))
-
-    side_vector = f_pts[2] - f_pts[3]
-    side_vector = side_vector / np.linalg.norm(side_vector)
-    up_vector = np.array([side_vector[1], -side_vector[0]])
-
-    nest_rect[0] = (percent_of_perspective * f_pts[0] +
-                    (1 - percent_of_perspective) * f_pts[3] -
-                    4*side_vector * buffer)
-    nest_rect[2] = f_pts[2] + 4 * buffer * side_vector - buffer * up_vector
-    nest_rect[3] = f_pts[3] - 4 * buffer * side_vector - buffer * up_vector
-    nest_rect[1] = (percent_of_perspective * f_pts[1] +
-                    (1 - percent_of_perspective) * f_pts[2] +
-                    4 * side_vector * buffer)
-
-    return nest_rect
-
-
-def loom_calculator(f_pts: np.ndarray, percent_of_perspective: float = 0.1506,
-                   radius: float = 32) -> Tuple[np.ndarray, float]:
-    """
-    Calculate loom zone center and radius from floor corners.
-
-    Args:
-        f_pts: Floor corners as 4x2 array [TL, TR, BR, BL] (CW from top-left, COCO standard)
-        percent_of_perspective: Percentage down from top for loom placement (default 0.1506)
-        radius: Loom circle radius in pixels (default 32)
-
-    Returns:
-        tuple: (center as [x, y], radius)
-    """
-    loom_circle = np.zeros(2)
-
-    down_vector = f_pts[3] - f_pts[0]  # Vector from TL (0) to BL (3)
-    loom_circle = 0.5 * (f_pts[0] + f_pts[1]) + (down_vector * percent_of_perspective)
-
-    return loom_circle, radius
-
-
-# =============================================================================
-# MANUAL ROI LABELING GUI
-# =============================================================================
-
-class ManualROILabeler:
-    """
-    Interactive GUI for manually labeling the behavioral arena floor.
-
-    User can click to place 4 corners (top-left, then CW: top-right,
-    bottom-right, bottom-left) and drag to adjust positions.
-
-    COCO standard ordering: [TL, TR, BR, BL] (clockwise from top-left)
-
-    Controls:
-        - Left click: Place/select point
-        - Drag: Move selected point
-        - 'r': Reset all points
-        - 'a': Accept current points (if all 4 are placed)
-        - Enter: Same as 'a'
-        - Esc: Cancel (use previous ROI if available, else error)
-    """
-
-    def __init__(self, image: np.ndarray, previous_roi: Optional[np.ndarray] = None):
-        self.image = image.copy()
-        self.display_image = None
-        self.original_image = image.copy()
-
-        self.points: List[Tuple[int, int]] = []
-        if previous_roi is not None and len(previous_roi) == 4:
-            self.points = [tuple(map(int, p)) for p in previous_roi]
-
-        self.selected_point_idx: Optional[int] = None
-        self.dragging = False
-
-        self.point_radius = 8
-        self.line_thickness = 2
-        self.point_colors = [
-            (0, 255, 0),    # Top-left: Green
-            (255, 255, 0),  # Top-right: Cyan
-            (0, 0, 255),    # Bottom-right: Red
-            (255, 0, 0)     # Bottom-left: Blue
-        ]
-        self.line_color = (0, 255, 255)  # Yellow
-        self.selected_color = (255, 255, 255)  # White
-
-        self.window_name = "Manual ROI Labeling - Place 4 corners (Top-Left, then CW)"
-
-    def _find_nearest_point(self, x: int, y: int, threshold: int = 15) -> Optional[int]:
-        if not self.points:
-            return None
-        distances = [np.sqrt((px - x)**2 + (py - y)**2) for px, py in self.points]
-        min_idx = np.argmin(distances)
-        if distances[min_idx] <= threshold:
-            return min_idx
-        return None
-
-    def _draw_overlay(self):
-        self.display_image = self.original_image.copy()
-
-        if len(self.points) >= 2:
-            pts = np.array(self.points, dtype=np.int32)
-            if len(self.points) == 4:
-                cv2.polylines(self.display_image, [pts], isClosed=True,
-                            color=self.line_color, thickness=self.line_thickness)
-            else:
-                cv2.polylines(self.display_image, [pts], isClosed=False,
-                            color=self.line_color, thickness=self.line_thickness)
-
-        for idx, (px, py) in enumerate(self.points):
-            color = self.selected_color if idx == self.selected_point_idx else self.point_colors[idx]
-            cv2.circle(self.display_image, (px, py), self.point_radius, color, 2)
-            cv2.circle(self.display_image, (px, py), self.point_radius + 2, (255, 255, 255), 1)
-            cv2.circle(self.display_image, (px, py), 2, color, -1)
-
-            label = ["TL", "TR", "BR", "BL"][idx]
-            cv2.putText(self.display_image, label, (px + 12, py - 12),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-        instructions = [
-            f"Points: {len(self.points)}/4",
-            "Click: Place/Select | Drag: Move | R: Reset",
-            "A/Enter: Accept | Esc: Cancel"
-        ]
-
-        y_offset = 30
-        for instruction in instructions:
-            cv2.putText(self.display_image, instruction, (10, y_offset),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            y_offset += 25
-
-        if len(self.points) == 4:
-            cv2.putText(self.display_image, "Press 'A' or Enter to accept!",
-                       (10, self.display_image.shape[0] - 20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-    def _mouse_callback(self, event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            nearest_idx = self._find_nearest_point(x, y)
-            if nearest_idx is not None:
-                self.selected_point_idx = nearest_idx
-                self.dragging = True
-            elif len(self.points) < 4:
-                self.points.append((x, y))
-                self.selected_point_idx = len(self.points) - 1
-            self._draw_overlay()
-            cv2.imshow(self.window_name, self.display_image)
-
-        elif event == cv2.EVENT_MOUSEMOVE:
-            if self.dragging and self.selected_point_idx is not None:
-                self.points[self.selected_point_idx] = (x, y)
-                self._draw_overlay()
-                cv2.imshow(self.window_name, self.display_image)
-
-        elif event == cv2.EVENT_LBUTTONUP:
-            self.dragging = False
-
-    def label(self) -> Optional[np.ndarray]:
-        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
-        cv2.setMouseCallback(self.window_name, self._mouse_callback)
-
-        self._draw_overlay()
-        cv2.imshow(self.window_name, self.display_image)
-
-        if len(self.points) == 4:
-            print("\n  Previous ROI loaded. Press 'A' or Enter to accept, or adjust points.")
-
-        while True:
-            key = cv2.waitKey(1) & 0xFF
-
-            if key == ord('r') or key == ord('R'):
-                self.points = []
-                self.selected_point_idx = None
-                self.dragging = False
-                print("  Points reset")
-                self._draw_overlay()
-                cv2.imshow(self.window_name, self.display_image)
-
-            elif key == ord('a') or key == ord('A') or key == 13:
-                if len(self.points) == 4:
-                    cv2.destroyAllWindows()
-                    return np.array(self.points, dtype=np.float32)
-                else:
-                    print(f"  Need 4 points, currently have {len(self.points)}")
-
-            elif key == 27:
-                cv2.destroyAllWindows()
-                if len(self.points) == 4:
-                    print("  Cancelled - using previous ROI")
-                    return np.array(self.points, dtype=np.float32)
-                else:
-                    print("  Cancelled - no valid ROI")
-                    return None
-
-
-def load_previous_manual_roi(config_path: Optional[str] = None,
-                             video_name: Optional[str] = None) -> Optional[np.ndarray]:
-    """Load previously saved manual ROI from config file."""
-    if config_path is None or not os.path.exists(config_path):
-        return None
-
-    try:
-        with open(config_path, 'r') as f:
-            config = json.load(f)
-        if video_name and video_name in config.get('manual_rois', {}):
-            roi_data = config['manual_rois'][video_name]
-            return np.array(roi_data, dtype=np.float32)
-    except (json.JSONDecodeError, KeyError, ValueError) as e:
-        print(f"  Warning: Could not load previous ROI from config: {e}")
-
-    return None
-
-
-def save_manual_roi_to_config(roi_corners: np.ndarray,
-                              config_path: str,
-                              video_name: str):
-    """Save manual ROI to config file for future use."""
-    if os.path.exists(config_path):
-        with open(config_path, 'r') as f:
-            config = json.load(f)
-    else:
-        config = {}
-
-    if 'manual_rois' not in config:
-        config['manual_rois'] = {}
-
-    config['manual_rois'][video_name] = roi_corners.tolist()
-
-    os.makedirs(os.path.dirname(config_path), exist_ok=True)
-    with open(config_path, 'w') as f:
-        json.dump(config, f, indent=2)
-
-    print(f"  Saved manual ROI to config: {config_path}")
-
-
-def manual_roi_labeling(background: np.ndarray,
-                       config_path: Optional[str] = None,
-                       video_name: Optional[str] = None,
-                       nest_percent: float = 0.1955,
-                       nest_buffer: float = 40,
-                       loom_percent: float = 0.1506,
-                       loom_radius: float = 32) -> Dict:
-    """
-    Main function for manual ROI labeling with GUI.
-
-    Args:
-        background: Background image to label
-        config_path: Optional path to config file for loading/saving ROIs
-        video_name: Name of video (for config lookup)
-        nest_percent: Percentage of perspective for nest calculation
-        nest_buffer: Buffer distance for nest zone
-        loom_percent: Percentage of perspective for loom calculation
-        loom_radius: Radius of loom circle
-
-    Returns:
-        dict: Complete ROI data including floor, nest, and loom zones
-    """
-    print("\n[MANUAL ROI LABELING]")
-
-    previous_roi = load_previous_manual_roi(config_path, video_name)
-    if previous_roi is not None:
-        print(f"  Loaded previous ROI for {video_name}")
-
-    labeler = ManualROILabeler(background, previous_roi=previous_roi)
-    roi_corners = labeler.label()
-
-    if roi_corners is None:
-        raise RuntimeError("Manual ROI labeling cancelled without valid ROI")
-
-    if config_path and video_name:
-        save_manual_roi_to_config(roi_corners, config_path, video_name)
-
-    nest_corners = nest_calculator(roi_corners, nest_percent, nest_buffer)
-    loom_center, loom_rad = loom_calculator(roi_corners, loom_percent, loom_radius)
-
-    roi_data = {
-        'regions': [
-            {'floor': roi_corners.tolist()},
-            {'nest': nest_corners.tolist()},
-            {'loom': [loom_center.tolist(), loom_rad]}
-        ]
-    }
-
-    center = roi_corners.mean(axis=0)
-    width = (np.linalg.norm(roi_corners[1] - roi_corners[0]) +
-             np.linalg.norm(roi_corners[2] - roi_corners[3])) / 2
-    height = (np.linalg.norm(roi_corners[3] - roi_corners[0]) +
-              np.linalg.norm(roi_corners[2] - roi_corners[1])) / 2
-    top_edge = roi_corners[1] - roi_corners[0]
-    angle = np.arctan2(top_edge[1], top_edge[0]) * 180 / np.pi
-
-    roi_data['metadata'] = {
-        'center': center.tolist(),
-        'width': float(width),
-        'height': float(height),
-        'angle': float(angle),
-        'confidence': 1.0,
-        'method': 'manual_gui_labeling'
-    }
-
-    print(f"  [OK] Manual ROI labeled: {width:.1f} x {height:.1f} pixels")
-    print(f"  [OK] Nest zone calculated: {len(nest_corners)} corners")
-    print(f"  [OK] Loom zone calculated: center={loom_center}, radius={loom_rad}")
-
-    return roi_data
-
-
-def visualize_roi_zones(background: np.ndarray, roi_data: Dict) -> np.ndarray:
-    """Create visualization of all ROI zones on background image."""
     vis_image = background.copy()
 
-    floor_pts = np.array(roi_data['regions'][0]['floor'], dtype=np.int32)
-    nest_pts = np.array(roi_data['regions'][1]['nest'], dtype=np.int32)
-    loom_center = np.array(roi_data['regions'][2]['loom'][0], dtype=np.int32)
-    loom_radius = int(roi_data['regions'][2]['loom'][1])
+    if 'regions' in roi_data:
+        for region in roi_data['regions']:
+            if 'floor' in region:
+                floor_pts = np.array(region['floor'], dtype=np.int32)
+                cv2.polylines(vis_image, [floor_pts], isClosed=True, color=(0, 255, 0), thickness=3)
+                for i, pt in enumerate(floor_pts):
+                    cv2.circle(vis_image, tuple(pt), 8, (0, 255, 0), -1)
+                    label = ["TL", "TR", "BR", "BL"][i]
+                    cv2.putText(vis_image, label, (pt[0]+12, pt[1]-12),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-    cv2.polylines(vis_image, [floor_pts], isClosed=True, color=(0, 255, 0), thickness=3)
-    for i, pt in enumerate(floor_pts):
-        cv2.circle(vis_image, tuple(pt), 8, (0, 255, 0), -1)
-        label = ["TL", "TR", "BR", "BL"][i]
-        cv2.putText(vis_image, label, (pt[0]+12, pt[1]-12),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            if 'nest' in region:
+                nest_pts = np.array(region['nest'], dtype=np.int32)
+                cv2.polylines(vis_image, [nest_pts], isClosed=True, color=(255, 128, 0), thickness=2)
+                for pt in nest_pts:
+                    cv2.circle(vis_image, tuple(pt), 5, (255, 128, 0), -1)
 
-    cv2.polylines(vis_image, [nest_pts], isClosed=True, color=(255, 128, 0), thickness=2)
-    for pt in nest_pts:
-        cv2.circle(vis_image, tuple(pt), 5, (255, 128, 0), -1)
+            if 'loom' in region:
+                loom_center = np.array(region['loom'][0], dtype=np.int32)
+                loom_radius = int(region['loom'][1])
+                cv2.circle(vis_image, tuple(loom_center), loom_radius, (0, 0, 255), 2)
+                cv2.circle(vis_image, tuple(loom_center), 5, (0, 0, 255), -1)
 
-    cv2.circle(vis_image, tuple(loom_center), loom_radius, (0, 0, 255), 2)
-    cv2.circle(vis_image, tuple(loom_center), 5, (0, 0, 255), -1)
-
+    # Legend
     legend_y = 30
-    cv2.putText(vis_image, "Floor (Green)", (10, legend_y),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    legend_y += 30
-    cv2.putText(vis_image, "Nest (Orange)", (10, legend_y),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 128, 0), 2)
-    legend_y += 30
-    cv2.putText(vis_image, "Loom (Red)", (10, legend_y),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+    for label, color in [("Floor (Green)", (0, 255, 0)),
+                          ("Nest (Orange)", (255, 128, 0)),
+                          ("Loom (Red)", (0, 0, 255))]:
+        cv2.putText(vis_image, label, (10, legend_y),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        legend_y += 30
 
-    return vis_image
+    # Note coordinate space
+    cv2.putText(vis_image, "Cropped video space", (10, background.shape[0] - 15),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+    Path(output_image_path).parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(output_image_path, vis_image)
+    print(f"  [OK] Representative image (cropped): {output_image_path}")
 
 
-# =============================================================================
-# MAIN WORKFLOW
-# =============================================================================
-
-def main(snakemake):
+def transform_roi_to_cropped_space(roi_json_path: str, crop_result: dict):
     """
-    Main workflow for Snakemake integration.
+    Rewrite ROI JSON so that all coordinates are in cropped-video space.
 
-    Inputs:
-        snakemake.input.video: Path to input video
+    Transformation pipeline (applied in this order):
+      1. Rotate each point around the original frame centre by the correction
+         angle (same rotation applied to the video). This maps original-space
+         coordinates into the rotated-but-not-yet-cropped frame.
+      2. Shift by the canvas expansion padding (pad_x, pad_y) so coordinates
+         are in expanded-canvas space — matching the frame produced by
+         FFmpeg's rotate+expand filter.
+      3. Subtract the adjusted crop origin (crop_x_adjusted, crop_y_adjusted)
+         to produce final cropped-video coordinates.
 
-    Outputs:
-        snakemake.output.roi_data: JSON file with ROI detection results (floor, nest, loom)
-        snakemake.output.representative_image: JPEG visualization with all ROI zones
+    If no rotation was applied, steps 1 and 2 are no-ops and the function
+    behaves identically to the original crop-only transform.
 
-    Note:
-        Video metadata (fps, resolution, PTS timestamps) is now extracted
-        downstream by crop_video.py after cropping. This script focuses
-        exclusively on the interactive ROI labeling phase.
+    Args:
+        roi_json_path: Path to ROI JSON file (modified in-place)
+        crop_result: Dict from crop_video() containing crop offsets and
+                     rotation metadata.
     """
+    with open(roi_json_path, 'r') as f:
+        roi_data = json.load(f)
 
-    print("="*70)
-    print("VIDEO PREPROCESSING ROI LABELING")
-    print("="*70)
+    if 'regions' not in roi_data:
+        print("  WARNING: No 'regions' key in ROI JSON, skipping transform")
+        return
 
-    video_path = snakemake.input.video
-    video_name = Path(video_path).stem
+    rot = crop_result.get('rotation', {})
+    rotation_applied = rot.get('applied', False)
+    correction_angle = rot.get('correction_angle_deg', 0.0)
+    orig_w = rot.get('original_w', 0)
+    orig_h = rot.get('original_h', 0)
+    pad_x = rot.get('pad_x', 0.0)
+    pad_y = rot.get('pad_y', 0.0)
 
-    use_manual_roi = getattr(snakemake.params, 'use_manual_roi', False)
-    manual_roi_config = getattr(snakemake.params, 'manual_roi_config', None)
+    # Crop origin in expanded-canvas space (already adjusted in crop_video)
+    final_crop_x = crop_result['crop_x_adjusted']
+    final_crop_y = crop_result['crop_y_adjusted']
 
-    nest_percent = getattr(snakemake.params, 'nest_percent', 0.1955)
-    nest_buffer = getattr(snakemake.params, 'nest_buffer', 40)
-    loom_percent = getattr(snakemake.params, 'loom_percent', 0.1506)
-    loom_radius = getattr(snakemake.params, 'loom_radius', 32)
+    # Centre of original frame (rotation pivot used by FFmpeg)
+    cx = orig_w / 2.0
+    cy = orig_h / 2.0
 
-    # Step 1: Generate background image (OpenCV only)
-    print("\n[1/3] Generating representative background image...")
-    background = generate_background(
-        video_path,
-        frame_span=snakemake.params.frame_span,
-        use_median=False
-    )
-    print(f"  - Background shape: {background.shape}")
+    if rotation_applied:
+        print(f"  Rotation correction: {correction_angle:.3f}° around ({cx:.1f}, {cy:.1f})")
+        print(f"  Canvas expansion padding: ({pad_x:.1f}, {pad_y:.1f})")
+    print(f"  Final crop origin (expanded canvas): ({final_crop_x}, {final_crop_y})")
 
-    # Step 2: Detect or manually label ROI
-    print("\n[2/3] Determining behavioral arena ROI...")
+    def transform_point(pt):
+        """Apply rotate → pad-shift → crop-offset to a single [x, y] point."""
+        p = np.array(pt, dtype=float)
+        if rotation_applied:
+            # Step 1: rotate around original frame centre
+            p = rotate_point(p, cx, cy, correction_angle)
+            # Step 2: shift into expanded canvas space
+            p[0] += pad_x
+            p[1] += pad_y
+        # Step 3: subtract crop origin
+        p[0] -= final_crop_x
+        p[1] -= final_crop_y
+        return p.tolist()
 
-    if use_manual_roi:
-        print("  MODE: Manual GUI Labeling")
-        try:
-            roi_data = manual_roi_labeling(
-                background,
-                config_path=manual_roi_config,
-                video_name=video_name,
-                nest_percent=nest_percent,
-                nest_buffer=nest_buffer,
-                loom_percent=loom_percent,
-                loom_radius=loom_radius
-            )
-        except RuntimeError as e:
-            print(f"  ERROR: {e}")
-            raise
-    else:
-        print("  MODE: Automatic Detection")
+    for region in roi_data['regions']:
+        # Transform floor polygon
+        if 'floor' in region:
+            floor = [transform_point(pt) for pt in region['floor']]
+            region['floor'] = floor
+            print(f"  Transformed floor polygon ({len(floor)} vertices)")
 
-        detector = TrapBoxDetector(
-            min_area_ratio=snakemake.params.min_area_ratio
-        )
+        # Transform nest polygon
+        if 'nest' in region:
+            nest = [transform_point(pt) for pt in region['nest']]
+            region['nest'] = nest
+            print(f"  Transformed nest polygon ({len(nest)} vertices)")
 
-        roi_result = detector.detect_from_image(background)
+        # Transform loom circle centre (radius unaffected by rotation/translation)
+        if 'loom' in region:
+            loom_center = transform_point(region['loom'][0])
+            region['loom'][0] = loom_center
+            print(f"  Transformed loom center to ({loom_center[0]:.1f}, {loom_center[1]:.1f})")
 
-        if roi_result is None:
-            print("  [WARNING] ROI detection failed, using full frame")
-            h, w = background.shape[:2]
-            floor_corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32)
-            confidence = 0.0
-            method = 'fallback_full_frame'
-        else:
-            print(f"  - Confidence: {roi_result.confidence:.3f}")
-            print(f"  - Method: {roi_result.method}")
-            print(f"  - Dimensions: {roi_result.width:.1f} x {roi_result.height:.1f}")
-            floor_corners = np.array(roi_result.corners, dtype=np.float32)
-            confidence = float(roi_result.confidence)
-            method = roi_result.method
-
-        nest_corners = nest_calculator(floor_corners, nest_percent, nest_buffer)
-        loom_center, loom_rad = loom_calculator(floor_corners, loom_percent, loom_radius)
-
-        roi_data = {
-            'regions': [
-                {'floor': floor_corners.tolist()},
-                {'nest': nest_corners.tolist()},
-                {'loom': [loom_center.tolist(), loom_rad]}
-            ]
+    # Record the full transform in metadata for auditability
+    if 'metadata' in roi_data:
+        roi_data['metadata']['coordinate_space'] = 'cropped'
+        roi_data['metadata']['transform_applied'] = {
+            'rotation_deg': correction_angle if rotation_applied else 0.0,
+            'rotation_centre': [cx, cy] if rotation_applied else None,
+            'canvas_pad': [pad_x, pad_y] if rotation_applied else [0, 0],
+            'crop_origin': [final_crop_x, final_crop_y],
         }
 
-        center = floor_corners.mean(axis=0)
-        width = (np.linalg.norm(floor_corners[1] - floor_corners[0]) +
-                 np.linalg.norm(floor_corners[2] - floor_corners[3])) / 2
-        height = (np.linalg.norm(floor_corners[3] - floor_corners[0]) +
-                  np.linalg.norm(floor_corners[2] - floor_corners[1])) / 2
-        top_edge = floor_corners[1] - floor_corners[0]
-        angle = np.arctan2(top_edge[1], top_edge[0]) * 180 / np.pi
-
-        roi_data['metadata'] = {
-            'center': center.tolist(),
-            'width': float(width),
-            'height': float(height),
-            'angle': float(angle),
-            'confidence': confidence,
-            'method': method
-        }
-
-        print(f"  [OK] Floor ROI: {width:.1f} x {height:.1f} pixels")
-        print(f"  [OK] Nest zone calculated: {len(nest_corners)} corners")
-        print(f"  [OK] Loom zone calculated: center={loom_center}, radius={loom_rad}")
-
-    # Step 3: Save ROI data
-    # Note: Representative image is now generated by crop_video.py using
-    # the cropped video and transformed ROI coordinates, so the QC image
-    # matches the coordinate space used by SLEAP and downstream analysis.
-    print("\n[3/3] Saving ROI data...")
-
-    with open(snakemake.output.roi_data, 'w') as f:
+    with open(roi_json_path, 'w') as f:
         json.dump(roi_data, f, indent=2)
-    print(f"  [OK] ROI data: {snakemake.output.roi_data}")
 
-    print("\n" + "="*70)
-    print("PREPROCESSING COMPLETE")
-    print("="*70)
+    print(f"  [OK] ROI JSON updated in-place: {roi_json_path}")
+
+def main():
+    """Main entry point for command line or Snakemake."""
+    try:
+        # Snakemake integration
+        input_video = snakemake.input.video
+        roi_json = snakemake.input.roi_data
+        output_video = snakemake.output.cropped_video
+        metadata_path = snakemake.output.metadata
+        pts_csv_path = snakemake.output.pts_csv
+        representative_image = snakemake.output.representative_image
+        threads = snakemake.threads
+        apply_rotation_correction = snakemake.params.get("apply_rotation_correction", False)
+        rotation_threshold = snakemake.params.get("rotation_threshold", 10.0)
+    except NameError:
+        # Command line usage
+        if len(sys.argv) < 7:
+            print("Usage: crop_video.py <input_video> <roi_json> <output_video> "
+                  "<metadata_json> <pts_csv> <representative_image> [threads] "
+                  "[apply_rotation_correction] [rotation_threshold]")
+            sys.exit(1)
+
+        input_video = sys.argv[1]
+        roi_json = sys.argv[2]
+        output_video = sys.argv[3]
+        metadata_path = sys.argv[4]
+        pts_csv_path = sys.argv[5]
+        representative_image = sys.argv[6]
+        threads = int(sys.argv[7]) if len(sys.argv) > 7 else 4
+        apply_rotation_correction = sys.argv[8].lower() == 'true' if len(sys.argv) > 8 else False
+        rotation_threshold = float(sys.argv[9]) if len(sys.argv) > 9 else 10.0
+
+    print("=" * 70)
+    print("VIDEO CROP + METADATA EXTRACTION")
+    print("=" * 70)
+    if apply_rotation_correction:
+        print(f"Rotation correction: ENABLED (threshold: {rotation_threshold}°)")
+    else:
+        print("Rotation correction: DISABLED")
+
+    # Step 1: Crop video (with optional rotation)
+    print("\n[1/4] Cropping video...")
+    crop_result = crop_video(
+        input_video, roi_json, output_video, threads,
+        apply_rotation_correction=apply_rotation_correction,
+        rotation_threshold=rotation_threshold
+    )
+
+    # Step 2: Probe cropped video for metadata + PTS
+    print("\n[2/4] Extracting metadata and frame timestamps...")
+    probe_cropped_video(output_video, metadata_path, pts_csv_path, crop_result)
+
+    # Step 3: Transform ROI coordinates from original to cropped video space
+    print("\n[3/4] Transforming ROI coordinates to cropped video space...")
+    transform_roi_to_cropped_space(roi_json, crop_result)
+
+    # Step 4: Generate representative image from cropped video with transformed ROIs
+    print("\n[4/4] Generating representative image from cropped video...")
+    generate_cropped_representative_image(output_video, roi_json, representative_image)
+
+    print("\n" + "=" * 70)
+    print("CROP + PROBE + ROI TRANSFORM + QC IMAGE COMPLETE")
+    print("=" * 70)
 
 
-if __name__ == '__main__':
-    main(snakemake)
+if __name__ == "__main__":
+    main()

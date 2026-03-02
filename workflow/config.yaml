@@ -50,8 +50,14 @@ preprocessing:
   canny_threshold_low: 30
   canny_threshold_high: 50
   
-  # Whether to apply rotation correction
+  # How many pixels to leave cropped around the floor. Note this is a minimum, 
+  crop_buffer: 50
+
+  # Whether to apply rotation correction to tilted videos (this is time consuming and not lossless)
   apply_rotation_correction: true
+
+  # Degrees of tolerance before telling the encoder to rotate 
+  rotation_threshold: 10
 
 
 # Event Sources Configuration
