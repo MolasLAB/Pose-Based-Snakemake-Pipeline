@@ -354,7 +354,7 @@ def calculate_crop_params(roi_json_path: str, video_width: int, video_height: in
 # =============================================================================
 
 def crop_video(input_video: str, roi_json: str, output_video: str, threads: int = 4,
-               apply_rotation_correction: bool = False, rotation_threshold: float = 15.0):
+               apply_rotation_correction: bool = False, rotation_threshold: float = 15.0, buffer: int = 50):
     """
     Crop video using ffmpeg based on ROI coordinates, with optional rotation correction.
 
@@ -408,7 +408,7 @@ def crop_video(input_video: str, roi_json: str, output_video: str, threads: int 
     # --- Crop parameter calculation (in original video space) ---
     # calculate_crop_params computes the bounding box in original coordinates.
     # If rotation is applied, the crop origin must be shifted by the canvas padding.
-    crop_result = calculate_crop_params(roi_json, video_width, video_height)
+    crop_result = calculate_crop_params(roi_json, video_width, video_height, buffer=buffer)
 
     if correction_angle != 0.0:
         # Adjust crop origin for the expanded canvas
@@ -798,7 +798,7 @@ def main():
     # Step 1: Crop video (with optional rotation)
     print("\n[1/4] Cropping video...")
     crop_result = crop_video(
-        input_video, roi_json, output_video, threads, crop_buffer=crop_buffer
+        input_video, roi_json, output_video, threads, buffer=crop_buffer,
         apply_rotation_correction=apply_rotation_correction,
         rotation_threshold=rotation_threshold
     )

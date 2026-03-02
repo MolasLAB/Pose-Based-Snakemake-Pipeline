@@ -253,8 +253,8 @@ rule crop_video:
         roi_data_cropped = BASE_PATH + "/{identity}/{day}/pipeline/metadata/{identity}_{day}_roi_cropped.json",
         representative_image = BASE_PATH + "/{identity}/{day}/pipeline/qc/{identity}_{day}_representative.jpeg"
     params:
-        crop_buffer = config["preprocessing"]["crop_buffer"]
-        rotation_threshold = config["preprocessing"]["rotation_threshold"]
+        crop_buffer = config["preprocessing"]["crop_buffer"],
+        rotation_threshold = config["preprocessing"]["rotation_threshold"],
         apply_rotation_correction = config["preprocessing"]["apply_rotation_correction"]
     log:
         BASE_PATH + "/{identity}/{day}/pipeline/logs/{identity}_{day}_crop.log"
