@@ -35,6 +35,48 @@ from shapely import distance as shapely_distance
 from analysis_config import build_calculated_features
 from analysis_config_single import build_calculated_features_single
 
+# For faster computation 
+from numba import jit
+import math
+
+@jit(nopython=True, fastmath=True)
+def _euclidean(p, q):
+    d = p - q
+    return math.sqrt(d[0]*d[0] + d[1]*d[1])
+
+@jit(nopython=True)
+def _get_linear_frechet(p, q):
+    """
+    Compute the discrete Fréchet distance between two polylines p and q.
+
+    Implements the linear-time dynamic programming algorithm described by
+    Eiter & Mannila (1994). This is a JIT-compiled adaptation of the
+    LinearDiscreteFrechet class written by João Paulo Figueira, whose full
+    implementation (including sparse and fast variants) can be found at:
+    https://github.com/joaofig/discrete-frechet
+
+    Args:
+        p: (N, 2) array of 2D points
+        q: (M, 2) array of 2D points
+
+    Returns:
+        Scalar discrete Fréchet distance between p and q
+    """
+    n_p = p.shape[0]
+    n_q = q.shape[0]
+    ca = np.zeros((n_p, n_q), dtype=np.float64)
+    for i in range(n_p):
+        for j in range(n_q):
+            d = _euclidean(p[i], q[j])
+            if i > 0 and j > 0:
+                ca[i, j] = max(min(ca[i-1, j], ca[i-1, j-1], ca[i, j-1]), d)
+            elif i > 0:
+                ca[i, j] = max(ca[i-1, 0], d)
+            elif j > 0:
+                ca[i, j] = max(ca[0, j-1], d)
+            else:
+                ca[i, j] = d
+    return ca[n_p-1, n_q-1]
 
 # =============================================================================
 # Data loading functions
@@ -546,7 +588,63 @@ class AnimalBehaviorAnalyzer:
 
         data = self.df[facing_col][loomtime:loomtime + int(self.fps * 7.5)]
         return data.mean() * 100
+    #
+    # TRAJECTORY FEATURES
+    #
+    def _get_trajectory(self, animal_index: int, loom_index: int) -> Optional[np.ndarray]:
+        """
+        Extract body_center trajectory from loom onset to nest entry.
 
+        Returns an (N, 2) array in pixels, or None if the animal never
+        reached the nest in this loom window.
+        """
+        loom_frame = self.loom_session_and_end[loom_index]
+
+        latency = self.timepoints[animal_index - 1]["latency"][loom_index]
+        if latency == -1:
+            return None  # Animal never made it to the nest
+
+        nest_entry_frame = loom_frame + int(latency)
+
+        x = self.df[f'body_center_{animal_index}_x'].to_numpy()
+        y = self.df[f'body_center_{animal_index}_y'].to_numpy()
+
+        traj = np.stack([x[loom_frame:nest_entry_frame + 1],
+                        y[loom_frame:nest_entry_frame + 1]], axis=1).astype(np.float64)
+
+        if len(traj) < 2:
+            return None
+
+        return traj
+
+    def FrechetDistanceBetweenAnimals(self, animal_index: int, loom_index: int) -> float:
+        """
+        Discrete Fréchet distance (pixels) between the two animals' loom-to-nest
+        trajectories for a given loom event.
+
+        Uses LinearDiscreteFrechet (Eiter & Mannila) from João Paulo Figueira's
+        implementation, JIT-compiled via Numba.
+
+        Only meaningful for paired experiments; returns np.nan for singles or
+        when either animal failed to reach the nest.
+        """
+        if not self.pair:
+            return np.nan
+
+        #If already calculated return the value since it is symmetric
+        cache_key = f'_frechet_loom_{loom_index}'
+        if hasattr(self, cache_key):
+            return getattr(self, cache_key)
+
+        traj1 = self._get_trajectory(animal_index=1, loom_index=loom_index)
+        traj2 = self._get_trajectory(animal_index=2, loom_index=loom_index)
+
+        if traj1 is None or traj2 is None:
+            result = np.nan
+        else:
+            result = float(_get_linear_frechet(traj1, traj2))
+        setattr(self, cache_key, result)
+        return result
     # =========================================================================
     # VELOCITY FEATURES
     # =========================================================================

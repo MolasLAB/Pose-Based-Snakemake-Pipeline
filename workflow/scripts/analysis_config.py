@@ -227,7 +227,23 @@ def build_calculated_features(fps: float, pixels_per_cm: float) -> dict:
             "post": pixels_to_cm_per_sec,
             "multi": False
         },
+        # =====================================================================
+        # TRAJECTORY FEATURES
+        # =====================================================================
 
+        "Frechet Distance(start loom - nest entry)": {
+            "func": "FrechetDistanceBetweenAnimals",
+            "kwargs": {
+                "window": {
+                    "frame_start_point": "loomtime",
+                    "frame_end_point": "latency",
+                    "frame_end_offset": 0,
+                    "frame_start_offset": 0
+                }
+            },
+            "post": pixels_to_cm,
+            "multi": False
+        },
         # =====================================================================
         # MIDLINE ANGLE FEATURES (Social/Pair)
         # =====================================================================
