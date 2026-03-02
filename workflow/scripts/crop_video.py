@@ -656,7 +656,7 @@ def generate_cropped_representative_image(cropped_video: str, roi_json_path: str
     print(f"  [OK] Representative image (cropped): {output_image_path}")
 
 
-def transform_roi_to_cropped_space(roi_json_path: str, crop_result: dict):
+def transform_roi_to_cropped_space(roi_json_input_path: str, roi_json_output_path: str, crop_result: dict):
     """
     Rewrite ROI JSON so that all coordinates are in cropped-video space.
 
@@ -674,11 +674,12 @@ def transform_roi_to_cropped_space(roi_json_path: str, crop_result: dict):
     behaves identically to the original crop-only transform.
 
     Args:
-        roi_json_path: Path to ROI JSON file (modified in-place)
+        roi_json_input_path: Path to input ROI JSON file (original coordinates)
+        roi_json_output_path: Path to output ROI JSON file (cropped coordinates)
         crop_result: Dict from crop_video() containing crop offsets and
                      rotation metadata.
     """
-    with open(roi_json_path, 'r') as f:
+    with open(roi_json_input_path, 'r') as f:
         roi_data = json.load(f)
 
     if 'regions' not in roi_data:
@@ -749,20 +750,23 @@ def transform_roi_to_cropped_space(roi_json_path: str, crop_result: dict):
             'crop_origin': [final_crop_x, final_crop_y],
         }
 
-    with open(roi_json_path, 'w') as f:
+    # Write to OUTPUT file
+    Path(roi_json_output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(roi_json_output_path, 'w') as f:
         json.dump(roi_data, f, indent=2)
 
-    print(f"  [OK] ROI JSON updated in-place: {roi_json_path}")
+    print(f"  [OK] Transformed ROI JSON saved: {roi_json_output_path}")
 
 def main():
     """Main entry point for command line or Snakemake."""
     try:
         # Snakemake integration
         input_video = snakemake.input.video
-        roi_json = snakemake.input.roi_data
+        roi_json_input = snakemake.input.roi_data
         output_video = snakemake.output.cropped_video
         metadata_path = snakemake.output.metadata
         pts_csv_path = snakemake.output.pts_csv
+        roi_json_output = snakemake.output.roi_data_cropped  # eparate output path
         representative_image = snakemake.output.representative_image
         threads = snakemake.threads
         crop_buffer = snakemake.params.get("crop_buffer", 50)
@@ -770,22 +774,23 @@ def main():
         rotation_threshold = snakemake.params.get("rotation_threshold", 15.0)
     except NameError:
         # Command line usage
-        if len(sys.argv) < 7:
-            print("Usage: crop_video.py <input_video> <roi_json> <output_video> "
-                  "<metadata_json> <pts_csv> <representative_image> [threads] "
-                  "[apply_rotation_correction] [rotation_threshold]")
+        if len(sys.argv) < 8:
+            print("Usage: crop_video.py <input_video> <roi_json_input> <output_video> "
+                  "<metadata_json> <pts_csv> <roi_json_output> <representative_image> "
+                  "[threads] [crop_buffer] [apply_rotation_correction] [rotation_threshold]")
             sys.exit(1)
 
         input_video = sys.argv[1]
-        roi_json = sys.argv[2]
+        roi_json_input = sys.argv[2]
         output_video = sys.argv[3]
         metadata_path = sys.argv[4]
         pts_csv_path = sys.argv[5]
-        representative_image = sys.argv[6]
-        threads = int(sys.argv[7]) if len(sys.argv) > 7 else 4
-        crop_buffer = int(sys.argv[8]) if len(sys.argv) >8 else 50
-        apply_rotation_correction = sys.argv[9].lower() == 'true' if len(sys.argv) > 9 else False
-        rotation_threshold = float(sys.argv[10]) if len(sys.argv) > 10 else 15.0
+        roi_json_output = sys.argv[6]
+        representative_image = sys.argv[7]
+        threads = int(sys.argv[8]) if len(sys.argv) > 8 else 4
+        crop_buffer = int(sys.argv[9]) if len(sys.argv) > 9 else 50
+        apply_rotation_correction = sys.argv[10].lower() == 'true' if len(sys.argv) > 10 else False
+        rotation_threshold = float(sys.argv[11]) if len(sys.argv) > 11 else 15.0
 
     print("=" * 70)
     print("VIDEO CROP + METADATA EXTRACTION")
@@ -798,7 +803,7 @@ def main():
     # Step 1: Crop video (with optional rotation)
     print("\n[1/4] Cropping video...")
     crop_result = crop_video(
-        input_video, roi_json, output_video, threads, buffer=crop_buffer,
+        input_video, roi_json_input, output_video, threads, buffer=crop_buffer,
         apply_rotation_correction=apply_rotation_correction,
         rotation_threshold=rotation_threshold
     )
@@ -808,12 +813,13 @@ def main():
     probe_cropped_video(output_video, metadata_path, pts_csv_path, crop_result)
 
     # Step 3: Transform ROI coordinates from original to cropped video space
+    # FIXED: Save to separate output file instead of modifying input in-place
     print("\n[3/4] Transforming ROI coordinates to cropped video space...")
-    transform_roi_to_cropped_space(roi_json, crop_result)
+    transform_roi_to_cropped_space(roi_json_input, roi_json_output, crop_result)
 
     # Step 4: Generate representative image from cropped video with transformed ROIs
     print("\n[4/4] Generating representative image from cropped video...")
-    generate_cropped_representative_image(output_video, roi_json, representative_image)
+    generate_cropped_representative_image(output_video, roi_json_output, representative_image)
 
     print("\n" + "=" * 70)
     print("CROP + PROBE + ROI TRANSFORM + QC IMAGE COMPLETE")
