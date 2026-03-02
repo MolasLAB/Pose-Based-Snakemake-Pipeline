@@ -252,6 +252,10 @@ rule crop_video:
         pts_csv = BASE_PATH + "/{identity}/{day}/pipeline/metadata/{identity}_{day}_pts.csv",
         roi_data_cropped = BASE_PATH + "/{identity}/{day}/pipeline/metadata/{identity}_{day}_roi_cropped.json",
         representative_image = BASE_PATH + "/{identity}/{day}/pipeline/qc/{identity}_{day}_representative.jpeg"
+    params:
+        crop_buffer = config["preprocessing"]["crop_buffer"]
+        rotation_threshold = config["preprocessing"]["rotation_threshold"]
+        apply_rotation_correction = config["preprocessing"]["apply_rotation_correction"]
     log:
         BASE_PATH + "/{identity}/{day}/pipeline/logs/{identity}_{day}_crop.log"
     benchmark:
@@ -272,6 +276,7 @@ rule sleap_inference:
     """
     input:
         video = rules.crop_video.output.cropped_video,
+        metadata = rules.crop_video.output.metadata,
         centroid_model = config["sleap"]["centroid_model"],
         instance_model = config["sleap"]["instance_model"]
     output:
@@ -303,6 +308,8 @@ rule sleap_inference:
         env["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
         env["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
 
+        total_frames = metadata["frame_count"]
+
         with open(log[0], 'w') as logfile:
             logfile.write("=== SLEAP Inference Configuration ===\n")
             logfile.write(f"Experiment type: {params.experiment_type}\n")
@@ -329,6 +336,7 @@ rule sleap_inference:
             cmd = [
                 "conda", "run", "-n", "sleap", "sleap-track",
                 str(input.video),
+                "--frames", f"0-{total_frames - 6}", # cut off the last 5 frames of the video to avoid SLEAP crashing due to a known bug during SLEAP frame import. 
                 "-m", str(input.centroid_model),
                 "-m", str(input.instance_model),
                 "--batch_size", str(params.batch_size),
@@ -357,7 +365,7 @@ rule sleap_export_csv:
     Supports both SLEAP 1.5.2+ and 1.4.1 legacy methods.
     """
     input:
-        cleaned_slp = rules.sleap_inference.output.predictions_slp
+        cleaned_slp = ancient(rules.sleap_inference.output.predictions_slp) #Ancient prevents reruning the sleap rule if the sleap file is newer than outputs. Inference will still be rerun if further upstream changes are made.
     output:
         raw_csv = BASE_PATH + "/{identity}/{day}/pipeline/pose/{identity}_{day}_raw_poses.csv"
     priority: 3
