@@ -307,6 +307,7 @@ rule sleap_inference:
         env["CUDA_VISIBLE_DEVICES"] = str(params.gpu_device)
         env["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
         env["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
+        
         with open(input.metadata, "r") as f:
             data = json.load(f)
         total_frames = int(data["frame_count"])
