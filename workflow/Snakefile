@@ -307,8 +307,9 @@ rule sleap_inference:
         env["CUDA_VISIBLE_DEVICES"] = str(params.gpu_device)
         env["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
         env["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
-
-        total_frames = metadata["frame_count"]
+        with open(input.metadata, "r") as f:
+            data = json.load(f)
+        total_frames = int(data["frame_count"])
 
         with open(log[0], 'w') as logfile:
             logfile.write("=== SLEAP Inference Configuration ===\n")
@@ -365,7 +366,7 @@ rule sleap_export_csv:
     Supports both SLEAP 1.5.2+ and 1.4.1 legacy methods.
     """
     input:
-        cleaned_slp = ancient(rules.sleap_inference.output.predictions_slp) #Ancient prevents reruning the sleap rule if the sleap file is newer than outputs. Inference will still be rerun if further upstream changes are made.
+        cleaned_slp = ancient(rules.sleap_inference.output.predictions_slp)
     output:
         raw_csv = BASE_PATH + "/{identity}/{day}/pipeline/pose/{identity}_{day}_raw_poses.csv"
     priority: 3
@@ -396,7 +397,7 @@ rule sleap_export_csv:
             logfile.flush()
 
             result = subprocess.run(
-                cmd_new, stdout=logfile, stderr=subprocess.STDOUT, shell=True
+                cmd_new, stdout=logfile, stderr=subprocess.STDOUT  # Removed shell=True
             )
 
             if result.returncode != 0:
@@ -416,7 +417,10 @@ rule sleap_export_csv:
                 logfile.flush()
 
                 result = subprocess.run(
-                    cmd_legacy, stdout=logfile, stderr=subprocess.STDOUT, shell=True
+                    cmd_legacy, 
+                    stdout=logfile, 
+                    stderr=subprocess.STDOUT,
+                    cwd=workflow.basedir  # Added to find scripts/ directory
                 )
 
                 if result.returncode != 0:
