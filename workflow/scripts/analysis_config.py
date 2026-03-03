@@ -231,7 +231,7 @@ def build_calculated_features(fps: float, pixels_per_cm: float) -> dict:
         # TRAJECTORY FEATURES
         # =====================================================================
 
-        "Frechet Distance(start loom - nest entry)": {
+        "Frechet Distance body_center (start loom - nest entry)": {
             "func": "FrechetDistanceBetweenAnimals",
             "kwargs": {
                 "window": {
@@ -239,7 +239,58 @@ def build_calculated_features(fps: float, pixels_per_cm: float) -> dict:
                     "frame_end_point": "latency",
                     "frame_end_offset": 0,
                     "frame_start_offset": 0
-                }
+                },
+                "body_part": "body_center",
+                "same_start": True
+            },
+            "post": pixels_to_cm,
+            "multi": False
+        },
+
+        "Frechet Distance head (start loom - nest entry)": {
+            "func": "FrechetDistanceBetweenAnimals",
+            "kwargs": {
+                "window": {
+                    "frame_start_point": "loomtime",
+                    "frame_end_point": "latency",
+                    "frame_end_offset": 0,
+                    "frame_start_offset": 0
+                },
+                "body_part": "head",
+                "same_start": True
+            },
+            "post": pixels_to_cm,
+            "multi": False
+        },
+
+        
+        "Frechet Distance body_center (10s before loom - loom)": {
+            "func": "FrechetDistanceBetweenAnimals",
+            "kwargs": {
+                "window": {
+                    "frame_start_point": "loomtime",
+                    "frame_end_point": "loomtime",
+                    "frame_end_offset": 0,
+                    "frame_start_offset": -int(10 * fps)
+                },
+                "body_part": "body_center",
+                "same_start": True
+            },
+            "post": pixels_to_cm,
+            "multi": False
+        },
+
+        "Frechet Distance head (10s before loom - loom)": {
+            "func": "FrechetDistanceBetweenAnimals",
+            "kwargs": {
+                "window": {
+                    "frame_start_point": "loomtime",
+                    "frame_end_point": "loomtime",
+                    "frame_end_offset": 0,
+                    "frame_start_offset": -int(10 * fps)
+                },
+                "body_part": "head",
+                "same_start": True
             },
             "post": pixels_to_cm,
             "multi": False

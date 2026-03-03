@@ -591,58 +591,92 @@ class AnimalBehaviorAnalyzer:
     #
     # TRAJECTORY FEATURES
     #
-    def _get_trajectory(self, animal_index: int, loom_index: int) -> Optional[np.ndarray]:
+    def _get_trajectory_window(self, animal_index: int, body_part: str, start_frame: int, end_frame: int) -> Optional[np.ndarray]:
         """
-        Extract body_center trajectory from loom onset to nest entry.
+        Extract body_center trajectory between two absolute frame indices.
 
-        Returns an (N, 2) array in pixels, or None if the animal never
-        reached the nest in this loom window.
+        Returns an (N, 2) float64 array, or None if the window is empty/invalid.
         """
-        loom_frame = self.loom_session_and_end[loom_index]
+        if start_frame >= end_frame:
+            return None
 
-        latency = self.timepoints[animal_index - 1]["latency"][loom_index]
-        if latency == -1:
-            return None  # Animal never made it to the nest
+        x = self.df[f'{body_part}_{animal_index}_x'].to_numpy()
+        y = self.df[f'{body_part}_{animal_index}_y'].to_numpy()
 
-        nest_entry_frame = loom_frame + int(latency)
-
-        x = self.df[f'body_center_{animal_index}_x'].to_numpy()
-        y = self.df[f'body_center_{animal_index}_y'].to_numpy()
-
-        traj = np.stack([x[loom_frame:nest_entry_frame + 1],
-                        y[loom_frame:nest_entry_frame + 1]], axis=1).astype(np.float64)
+        traj = np.stack([x[start_frame:end_frame],
+                         y[start_frame:end_frame]], axis=1).astype(np.float64)
 
         if len(traj) < 2:
             return None
 
         return traj
 
-    def FrechetDistanceBetweenAnimals(self, animal_index: int, loom_index: int) -> float:
+    def FrechetDistanceBetweenAnimals(self, animal_index: int, loom_index: int, **kwargs) -> float:
         """
-        Discrete Fréchet distance (pixels) between the two animals' loom-to-nest
-        trajectories for a given loom event.
+        Discrete Fréchet distance (pixels) between the two animals' trajectories
+        over a configurable window around a loom event.
 
-        Uses LinearDiscreteFrechet (Eiter & Mannila) from João Paulo Figueira's
-        implementation, JIT-compiled via Numba.
+        The window is specified via the ``window`` kwarg using the same
+        ``window_cropper`` parameter schema as all other windowed functions::
+
+            FrechetDistanceBetweenAnimals(
+                animal_index=1, loom_index=0,
+                window={
+                    "frame_start_point": "loomtime",
+                    "frame_end_point":   "latency",
+                    "frame_end_offset":  0,
+                }
+            )
+
+        The intersection of the two animals' windows is used so the trajectories
+        span the same frames (via ``window_cropper_both``).
+
+        Uses LinearDiscreteFrechet (Eiter & Mannila), JIT-compiled via Numba.
 
         Only meaningful for paired experiments; returns np.nan for singles or
-        when either animal failed to reach the nest.
+        when the window resolves to [0, 0] for either animal.
+
+        Args:
+            animal_index: 1-based animal index (result is symmetric; cached).
+            loom_index:   Index of the loom event.
+            **kwargs:     Must contain a ``window`` key with cropper parameters.
+
+        Returns:
+            Scalar Fréchet distance in pixels, or np.nan.
         """
         if not self.pair:
             return np.nan
 
-        #If already calculated return the value since it is symmetric
-        cache_key = f'_frechet_loom_{loom_index}'
+        # Build a hashable cache key that encodes the window so different
+        # window configurations don't collide.
+        window_params = kwargs.get("window", {})
+        body_part = kwargs.get("body_part", "body_center")
+        same_start = kwargs.get("samestart", False)
+
+        cache_key = (
+            f'_frechet_loom_{loom_index}_'
+            + '_'.join(f'{k}{v}' for k, v in sorted(window_params.items()))
+        )
         if hasattr(self, cache_key):
             return getattr(self, cache_key)
 
-        traj1 = self._get_trajectory(animal_index=1, loom_index=loom_index)
-        traj2 = self._get_trajectory(animal_index=2, loom_index=loom_index)
+        start_frame, end_frame = self.window_cropper_both(loom_index=loom_index, **window_params)
 
-        if traj1 is None or traj2 is None:
+        if start_frame == 0 and end_frame == 0:
             result = np.nan
         else:
+            traj1 = self._get_trajectory_window(animal_index=1, body_part=body_part, start_frame=start_frame, end_frame=end_frame)
+            traj2 = self._get_trajectory_window(animal_index=2, body_part=body_part, start_frame=start_frame, end_frame=end_frame)
+                        
+            if traj1 is None or traj2 is None:
+                result = np.nan
+            
+            # move the start of both trajectories to origin (0,0)
+            if same_start: 
+                traj1 = traj1 - traj1[0]
+                traj2 = traj2 - traj2[0]
             result = float(_get_linear_frechet(traj1, traj2))
+
         setattr(self, cache_key, result)
         return result
     # =========================================================================
