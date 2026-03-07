@@ -368,6 +368,7 @@ rule sleap_export_csv:
     """
     input:
         cleaned_slp = ancient(rules.sleap_inference.output.predictions_slp)
+        video = ancient(rules.crop_video.output.cropped_video)
     output:
         raw_csv = BASE_PATH + "/{identity}/{day}/pipeline/pose/{identity}_{day}_raw_poses.csv"
     priority: 3
@@ -406,11 +407,12 @@ rule sleap_export_csv:
                 script_path = Path(workflow.basedir) / "scripts" / "sleap_legacy_export.py"
                 
                 sleap_cmd = [
-                        "conda", "run", "-n", "sleap", "python",
-                        str(script_path),
-                        str(input.cleaned_slp),
-                        str(output.raw_csv)
-                    ]
+                    "conda", "run", "-n", "sleap", "sleap-convert",
+                    str(input.cleaned_slp),
+                    "--format", "analysis.csv",
+                    "--video", str(input.video),
+                    "-o", str(output.raw_csv)
+                ]
             
             logfile.write(f"Command: {' '.join(sleap_cmd)}\n\n")
             logfile.flush()
