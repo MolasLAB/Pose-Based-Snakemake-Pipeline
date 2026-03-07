@@ -380,54 +380,48 @@ rule sleap_export_csv:
 
         ensure_output_dirs([output.raw_csv, log[0]])
 
-        cmd_new = [
-            "conda", "run", "-n", "sleap", "sleap-convert",
-            "--format", "analysis.csv",
-            "-o", str(output.raw_csv),
-            str(input.cleaned_slp)
-        ]
+        version_result = subprocess.run(
+            ["conda", "run", "-n", "sleap", "python", "-c",
+            "import sleap; from packaging.version import Version; print(Version(sleap.__version__) > Version('1.5.0'))"],
+            capture_output=True, text=True, shell=True
+        )
 
         with open(log[0], 'w') as logfile:
             logfile.write("=== SLEAP CSV Export ===\n")
             logfile.write(f"Input: {input.cleaned_slp}\n")
             logfile.write(f"Output: {output.raw_csv}\n")
             logfile.write("=" * 50 + "\n\n")
+            
+            if version_result.stdout.strip() =="True":
+                logfile.write("Attempting SLEAP 1.5.2+ export method...\n")
+        
+                sleap_cmd = [
+                    "conda", "run", "-n", "sleap", "sleap-convert",
+                    "--format", "analysis.csv",
+                    "-o", str(output.raw_csv),
+                    str(input.cleaned_slp),
+                ]
+            else:
+                logfile.write("Trying SLEAP 1.4.1 legacy method...\n")
 
-            logfile.write("Attempting SLEAP 1.5.2+ export method...\n")
-            logfile.write(f"Command: {' '.join(cmd_new)}\n\n")
+                sleap_cmd = [
+                        "conda", "run", "-n", "sleap", "python",
+                        "scripts/sleap_legacy_export.py",
+                        str(input.cleaned_slp),
+                        str(output.raw_csv)
+                    ]
+            
+            logfile.write(f"Command: {' '.join(sleap_cmd)}\n\n")
             logfile.flush()
 
             result = subprocess.run(
-                cmd_new, stdout=logfile, stderr=subprocess.STDOUT  # Removed shell=True
+                sleap_cmd, stdout=logfile, stderr=subprocess.STDOUT, shell=True
             )
 
             if result.returncode != 0:
-                logfile.write("\n" + "=" * 50 + "\n")
-                logfile.write("SLEAP 1.5.2+ method failed. Trying SLEAP 1.4.1 legacy method...\n")
-                logfile.write("=" * 50 + "\n\n")
-                logfile.flush()
-
-                cmd_legacy = [
-                    "conda", "run", "-n", "sleap", "python",
-                    "scripts/sleap_legacy_export.py",
-                    str(input.cleaned_slp),
-                    str(output.raw_csv)
-                ]
-
-                logfile.write(f"Command: {' '.join(cmd_legacy)}\n\n")
-                logfile.flush()
-
-                result = subprocess.run(
-                    cmd_legacy, 
-                    stdout=logfile, 
-                    stderr=subprocess.STDOUT,
-                    cwd=workflow.basedir  # Added to find scripts/ directory
+                raise RuntimeError(
+                    f"SLEAP CSV export failed. Check log: {log[0]}"
                 )
-
-                if result.returncode != 0:
-                    raise RuntimeError(
-                        f"SLEAP CSV export failed with both methods. Check log: {log[0]}"
-                    )
 
             logfile.write("\n" + "=" * 50 + "\n")
             logfile.write("CSV export completed successfully\n")
