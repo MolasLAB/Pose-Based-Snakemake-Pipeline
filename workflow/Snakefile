@@ -407,7 +407,7 @@ rule sleap_export_csv:
                 
                 sleap_cmd = [
                         "conda", "run", "-n", "sleap", "python",
-                        script_path,
+                        str(script_path),
                         str(input.cleaned_slp),
                         str(output.raw_csv)
                     ]
