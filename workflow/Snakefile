@@ -367,7 +367,7 @@ rule sleap_export_csv:
     Supports both SLEAP 1.5.2+ and 1.4.1 legacy methods.
     """
     input:
-        cleaned_slp = ancient(rules.sleap_inference.output.predictions_slp)
+        cleaned_slp = ancient(rules.sleap_inference.output.predictions_slp),
         video = ancient(rules.crop_video.output.cropped_video)
     output:
         raw_csv = BASE_PATH + "/{identity}/{day}/pipeline/pose/{identity}_{day}_raw_poses.csv"
