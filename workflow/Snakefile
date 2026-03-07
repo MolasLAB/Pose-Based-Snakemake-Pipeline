@@ -364,7 +364,10 @@ rule sleap_inference:
 rule sleap_export_csv:
     """
     Export SLEAP predictions to CSV format.
-    Supports both SLEAP 1.5.2+ and 1.4.1 legacy methods.
+    Three-tier fallback:
+    1. SLEAP 1.5.X in conda: use sleap-convert
+    2. System sleap-export (1.6+): use direct command
+    3. Legacy SLEAP 1.4.1: use custom Python script
     """
     input:
         cleaned_slp = ancient(rules.sleap_inference.output.predictions_slp),
@@ -381,31 +384,26 @@ rule sleap_export_csv:
 
         ensure_output_dirs([output.raw_csv, log[0]])
 
-        version_result = subprocess.run(
-            ["conda", "run", "-n", "sleap", "python", "-c",
-            "import sleap; from packaging.version import Version; print(Version(sleap.__version__) > Version('1.5.0'))"],
-            capture_output=True, text=True, shell=True
-        )
-
         with open(log[0], 'w') as logfile:
             logfile.write("=== SLEAP CSV Export ===\n")
-            logfile.write(f"Input: {input.cleaned_slp}\n")
-            logfile.write(f"Output: {output.raw_csv}\n")
+            logfile.write(f"Input SLP: {input.cleaned_slp}\n")
+            logfile.write(f"Input Video: {input.video}\n")
+            logfile.write(f"Output CSV: {output.raw_csv}\n")
             logfile.write("=" * 50 + "\n\n")
             
-            if version_result.stdout.strip() =="True":
-                logfile.write("Attempting SLEAP 1.5.2+ export method...\n")
-        
-                sleap_cmd = [
-                    "conda", "run", "-n", "sleap", "sleap-convert",
-                    "--format", "analysis.csv",
-                    "-o", str(output.raw_csv),
-                    str(input.cleaned_slp),
-                ]
-            else:
-                logfile.write("Trying SLEAP 1.4.1 legacy method...\n")
-                script_path = Path(workflow.basedir) / "scripts" / "sleap_legacy_export.py"
-                
+            # Check conda SLEAP version
+            version_check = subprocess.run(
+                ["conda", "run", "-n", "sleap", "python", "-c",
+                "import sleap; print(sleap.__version__)"],
+                capture_output=True, text=True, shell=True
+            )
+            
+            sleap_version = version_check.stdout.strip() if version_check.returncode == 0 else ""
+            logfile.write(f"Conda SLEAP version: {sleap_version}\n\n")
+            
+            # Strategy 1: SLEAP 1.5.X in conda
+            if sleap_version.startswith("1.5."):
+                logfile.write("Strategy 1: Using SLEAP 1.5.X sleap-convert...\n")
                 sleap_cmd = [
                     "conda", "run", "-n", "sleap", "sleap-convert",
                     str(input.cleaned_slp),
@@ -413,6 +411,34 @@ rule sleap_export_csv:
                     "--video", str(input.video),
                     "-o", str(output.raw_csv)
                 ]
+            
+            else:
+                # Strategy 2: Check if sleap-export exists in system PATH (SLEAP 1.6+)
+                system_sleap_check = subprocess.run(
+                    ["sleap-export", "--version"],
+                    capture_output=True, text=True, shell=False
+                )
+                
+                if system_sleap_check.returncode == 0:
+                    logfile.write(f"Strategy 2: Using system sleap-export (found in PATH)...\n")
+                    logfile.write(f"System SLEAP version: {system_sleap_check.stdout.strip()}\n")
+                    sleap_cmd = [
+                        "sleap-export",
+                        str(input.cleaned_slp),
+                        "--format", "csv",
+                        "-o", str(output.raw_csv)
+                    ]
+                
+                else:
+                    # Strategy 3: Fallback to legacy script
+                    logfile.write("Strategy 3: Falling back to legacy script (SLEAP 1.4.1)...\n")
+                    script_path = Path(workflow.basedir) / "scripts" / "sleap_legacy_export.py"
+                    sleap_cmd = [
+                        "conda", "run", "-n", "sleap", "python",
+                        str(script_path),
+                        str(input.cleaned_slp),
+                        str(output.raw_csv)
+                    ]
             
             logfile.write(f"Command: {' '.join(sleap_cmd)}\n\n")
             logfile.flush()
