@@ -403,10 +403,11 @@ rule sleap_export_csv:
                 ]
             else:
                 logfile.write("Trying SLEAP 1.4.1 legacy method...\n")
-
+                script_path = Path(workflow.basedir) / "scripts" / "sleap_legacy_export.py"
+                
                 sleap_cmd = [
                         "conda", "run", "-n", "sleap", "python",
-                        "scripts/sleap_legacy_export.py",
+                        script_path,
                         str(input.cleaned_slp),
                         str(output.raw_csv)
                     ]
